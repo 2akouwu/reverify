@@ -1,7 +1,7 @@
 # Pinned Linux replication environment: engines + binutils (objdump oracle), tests, gated benchmarks.
 #   docker build -t reverify-bench -f benchmarks/Dockerfile .
 #   docker run --rm reverify-bench
-FROM python:3.13-slim
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
 
 RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/*
 

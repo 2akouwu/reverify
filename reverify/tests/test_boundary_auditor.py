@@ -152,14 +152,46 @@ class TestStateIntegrityAuditor(unittest.TestCase):
 
 
 class TestFullAudit(unittest.TestCase):
-    """Test end-to-end full audit report generation."""
+    """Test end-to-end full audit report generation.
+
+    ``env_snapshot`` is always passed explicitly here so these tests stay
+    deterministic regardless of what the ambient process environment (CI runner,
+    developer machine, ...) happens to contain — ``run_full_security_audit``
+    defaults to the real ``os.environ`` only when the caller (e.g. the live CLI)
+    doesn't supply a snapshot.
+    """
 
     def test_full_security_audit_run(self):
-        report = run_full_security_audit(str(Path(__file__).resolve().parent))
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            env_snapshot={"HOME": "/home/user"},
+        )
         self.assertEqual(report["status"], "PASS")
         self.assertTrue(report["filesystem_audit"]["traversal_blocked"])
         self.assertTrue(len(report["network_audit"]) > 0)
+        self.assertEqual(report["environment_audit"]["secrets_detected"], 0)
         self.assertTrue(report["environment_audit"]["sanitized_safe"])
+
+    def test_full_security_audit_flags_leaked_secret(self):
+        # A snapshot with no OPENAI_API_KEY at all must not crash (regression test:
+        # sanitized_safe used to be hardcoded to that one key's presence) and a
+        # real secret under any key must still be detected and redacted.
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            env_snapshot={"DB_PASSWORD": "SuperSecretPassword123!"},
+        )
+        self.assertEqual(report["environment_audit"]["secrets_detected"], 1)
+        self.assertTrue(report["environment_audit"]["sanitized_safe"])
+
+    def test_full_security_audit_detects_dns_rebinding_target(self):
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            target_urls=["http://attacker.127.0.0.1.nip.io/", "https://api.openai.com/v1"],
+            env_snapshot={},
+        )
+        # Both dangerous URLs are correctly classified unsafe by the auditor
+        # itself, so the summary self-check must not flag a leak.
+        self.assertEqual(report["status"], "PASS")
 
 
 if __name__ == "__main__":

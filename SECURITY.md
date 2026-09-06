@@ -23,6 +23,8 @@ You are responsible for holding authorization for the artifacts and targets you 
 ## Reporting a vulnerability
 
 Report security issues in Reverify itself (path handling, code execution, sensitive-data
-exposure) via a private GitHub security advisory. Include the affected version/commit, a
-minimal reproduction that contains no real credentials or private data, and the observed
-versus expected behavior.
+exposure) via a private GitHub security advisory:
+<https://github.com/2akouwu/reverify/security/advisories/new>
+
+Include the affected version/commit, a minimal reproduction that contains no real credentials
+or private data, and the observed versus expected behavior.

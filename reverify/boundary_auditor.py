@@ -361,8 +361,18 @@ class StateIntegrityAuditor:
         }
 
 
-def run_full_security_audit(workspace_dir: str, target_urls: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Execute a comprehensive boundary audit report across filesystem, network, and environment."""
+def run_full_security_audit(
+    workspace_dir: str,
+    target_urls: Optional[List[str]] = None,
+    env_snapshot: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Execute a comprehensive boundary audit report across filesystem, network, and environment.
+
+    ``env_snapshot`` defaults to the real process environment (``os.environ``) so a
+    live ``reverify audit-boundary`` run audits the environment it actually runs in.
+    Pass an explicit dict (as the test suite does) to audit a fixed, reproducible
+    snapshot instead.
+    """
     report: Dict[str, Any] = {
         "status": "PASS",
         "workspace_root": str(Path(workspace_dir).resolve()),
@@ -404,21 +414,38 @@ def run_full_security_audit(workspace_dir: str, target_urls: Optional[List[str]]
         net_results.append(NetworkBoundaryAuditor.audit_url(u, allow_local=False))
     report["network_audit"] = net_results
 
-    # Environment audit
-    env_sample = {
-        "PATH": "C:\\Windows\\System32",
-        "USER": "developer",
-        "OPENAI_API_KEY": "sk-example-key-12345678901234567890",
-    }
-    env_res = EnvironmentBoundaryAuditor.audit_environment(env_sample)
+    # Environment audit — the real process environment unless a snapshot is injected
+    env_dict = dict(os.environ) if env_snapshot is None else env_snapshot
+    env_res = EnvironmentBoundaryAuditor.audit_environment(env_dict)
+    sanitized_preview = env_res["sanitized_preview"]
     report["environment_audit"] = {
         "secrets_detected": env_res["secret_count"],
-        "sanitized_safe": env_res["sanitized_preview"]["OPENAI_API_KEY"] == "[REDACTED_SECRET]",
+        # Every key the auditor flagged as a secret must come back redacted in the
+        # preview. Checking the general invariant (rather than one hardcoded key)
+        # means this holds regardless of which secret-shaped variables are present.
+        "sanitized_safe": all(
+            sanitized_preview.get(k) == "[REDACTED_SECRET]" for k in env_res["leaked_keys"]
+        ),
     }
 
     # Overall health
     has_fs_breach = not report["filesystem_audit"]["traversal_blocked"]
-    has_net_leak = any(r["is_safe"] for r in net_results if "169.254" in r["url"] or "127.0.0.1" in r["url"] or "2130706433" in r["url"] or "nip.io" in r["url"])
+    # Match on the parsed hostname (exact or dotted-suffix), not a substring of the
+    # raw URL: a plain `"nip.io" in url` check would also match an unrelated URL
+    # that merely contains that text elsewhere (e.g. a query string or a longer
+    # domain label), which is exactly the class of bug this replaces.
+    has_net_leak = False
+    for r in net_results:
+        host = (urlparse(r["url"]).hostname or "").lower()
+        flagged_host = (
+            host in ("127.0.0.1", "169.254.169.254", "::1")
+            or host == "nip.io"
+            or host.endswith(".nip.io")
+            or NetworkBoundaryAuditor.decode_numeric_ip(host) in ("127.0.0.1", "169.254.169.254")
+        )
+        if flagged_host and r["is_safe"]:
+            has_net_leak = True
+            break
 
     if has_fs_breach or has_net_leak or not report["environment_audit"]["sanitized_safe"]:
         report["status"] = "FAIL"

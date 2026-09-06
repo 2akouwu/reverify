@@ -32,8 +32,8 @@ jobs:
     env:
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -58,7 +58,7 @@ jobs:
           python -m coverage report | tail -n 3
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.deps == 'full'
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
@@ -71,13 +71,13 @@ jobs:
           python benchmarks/prologue_prior.py --per-dir 40 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the benchmark record (hashes, verdicts, tool versions)
         if: matrix.deps == 'full'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: benchmark-${{ matrix.os }}
           path: bench-*.json
       - name: MSVC developer environment (Windows)
         if: matrix.deps == 'full' && runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
       - name: Build the reproducible corpus from source (gcc / clang / cl, -O0 and -O2)
         if: matrix.deps == 'full'
         shell: bash
@@ -91,7 +91,7 @@ jobs:
           cp benchmarks/corpus/build/manifest.json "corpus-manifest-${{ matrix.os }}.json"
       - name: Keep the corpus manifest (toolchain versions, flags, hashes)
         if: matrix.deps == 'full'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: corpus-${{ matrix.os }}
           path: |
@@ -108,7 +108,7 @@ jobs:
             --json "recon-${{ matrix.os }}-${{ matrix.deps }}.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the reconstruction record
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: recon-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.deps }}
           path: recon-*.json
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: python benchmarks/verifier_matrix.py --per-dir 25 --json "matrix-${{ matrix.os }}-${{ matrix.deps }}.json" --fail-on-false-verified | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the matrix record
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: matrix-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.deps }}
           path: matrix-*.json

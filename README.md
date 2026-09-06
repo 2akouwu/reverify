@@ -9,6 +9,8 @@
   <a href="https://pypi.org/project/reverify/"><img src="https://img.shields.io/pypi/v/reverify?color=3fb950" alt="PyPI"></a>
   <img src="https://img.shields.io/pypi/pyversions/reverify" alt="Python">
   <a href="https://github.com/2akouwu/reverify/actions/workflows/ci.yml"><img src="https://github.com/2akouwu/reverify/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/2akouwu/reverify"><img src="https://codecov.io/gh/2akouwu/reverify/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/2akouwu/reverify"><img src="https://api.scorecard.dev/projects/github.com/2akouwu/reverify/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/2akouwu/reverify" alt="MIT"></a>
   <img src="https://img.shields.io/github/stars/2akouwu/reverify?style=social" alt="Stars">
 </p>

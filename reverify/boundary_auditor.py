@@ -436,7 +436,16 @@ def run_full_security_audit(
     # domain label), which is exactly the class of bug this replaces.
     has_net_leak = False
     for r in net_results:
-        host = (urlparse(r["url"]).hostname or "").lower()
+        try:
+            # .hostname raises ValueError on a malformed IPv6-bracket literal
+            # (e.g. an unclosed "[::1" or an invalid address inside brackets).
+            # NetworkBoundaryAuditor.audit_url() already caught that when it
+            # produced r["is_safe"]/r["findings"]; this summary pass must not
+            # re-raise on the same string, or a caller-supplied --urls value
+            # could crash the whole audit-boundary command.
+            host = (urlparse(r["url"]).hostname or "").lower()
+        except ValueError:
+            host = ""
         flagged_host = (
             host in ("127.0.0.1", "169.254.169.254", "::1")
             or host == "nip.io"

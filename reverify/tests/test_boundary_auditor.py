@@ -183,6 +183,19 @@ class TestFullAudit(unittest.TestCase):
         self.assertEqual(report["environment_audit"]["secrets_detected"], 1)
         self.assertTrue(report["environment_audit"]["sanitized_safe"])
 
+    def test_full_security_audit_survives_malformed_target_url(self):
+        # A malformed IPv6-bracket literal makes urlparse(...).hostname raise
+        # ValueError. The audit must still complete (not crash) and treat the
+        # unparseable target as already handled by NetworkBoundaryAuditor's own
+        # is_safe=False classification, not as a fatal error.
+        report = run_full_security_audit(
+            str(Path(__file__).resolve().parent),
+            target_urls=["http://[::1", "https://api.openai.com/v1"],
+            env_snapshot={},
+        )
+        self.assertEqual(len(report["network_audit"]), 2)
+        self.assertFalse(report["network_audit"][0]["is_safe"])
+
     def test_full_security_audit_detects_dns_rebinding_target(self):
         report = run_full_security_audit(
             str(Path(__file__).resolve().parent),

@@ -30,7 +30,7 @@ jobs:
           test "$tag" = "$ver"
       - name: Build and check
         run: |
-          python -m pip install build twine
+          python -m pip install build==1.6.0 twine==7.0.0
           python -m build
           python -m twine check dist/*
       - name: Build provenance attestation (SLSA) for the sdist and wheel

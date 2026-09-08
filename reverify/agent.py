@@ -99,7 +99,8 @@ RULES = """RULES (how claims are scored):
 - Weight is measured from the binary: content that occurs many times (zero padding, a common prologue, a pattern matching everywhere) weighs almost nothing even if it verifies. Aim for content that is specific to this binary.
 - Give claims an "id" and use "depends_on" when one rests on another (a struct layout on an image base), so a refuted root invalidates its dependents.
 - Do not copy the tools' previously observed value back as an "expected" value; that is an echo and scores zero.
-- The "note" field is never verified and is shown as unverified text."""
+- The "note" field is never verified and is shown as unverified text.
+- A goal about what a binary imports or exports, or a string / section / behavior it has? Reach for the structured kinds (import_present, export_present, string_present, section_present, behavior_equiv, prove_equiv) directly instead of guessing byte offsets with bytes_at."""
 
 
 def _extract_ascii_strings(data: bytes, min_len: int = 5, limit: int = 20) -> List[str]:

@@ -307,6 +307,10 @@ class Verifier:
         if off is None:
             return INCONCLUSIVE, {"address": addr, "file_size": len(self.data)}, addr.get("error", "bad address")
         n = length if length is not None else (len(expected) if expected is not None else 4)
+        if n <= 0:
+            # An empty assertion (zero bytes / zero length) is true everywhere and is never
+            # evidence of anything: refuse it rather than hand back a bare VERIFIED.
+            return INCONCLUSIVE, {"address": addr, "file_size": len(self.data)}, "empty assertion (no bytes claimed)"
         if off < 0 or off + n > len(self.data):
             return INCONCLUSIVE, {"address": addr, "file_size": len(self.data)}, "offset out of range"
         actual = self.data[off : off + n]
@@ -376,6 +380,10 @@ class Verifier:
         """Claim: AOB ``pattern`` occurs (optionally at ``offset`` / ``count`` times)."""
         if "pattern" not in p:
             raise ClaimError("pattern_present requires 'pattern'")
+        tokens = [t for t in str(p["pattern"]).split() if t not in ("?", "??")]
+        if not tokens:
+            # An all-wildcard or empty pattern matches every byte and is no claim at all.
+            return INCONCLUSIVE, {}, "pattern has no fixed bytes (nothing to verify)"
         matches = pattern_scan(self.data, str(p["pattern"]))
         fixed = [t for t in str(p["pattern"]).split() if t not in ("?", "??")]
         evidence: Dict[str, Any] = {
@@ -409,6 +417,9 @@ class Verifier:
             needle = str(p["value"]).encode(encoding)
         except LookupError:
             raise ClaimError(f"unknown encoding '{encoding}'")
+        if not needle:
+            # The empty string is a substring of every byte sequence: not evidence.
+            return INCONCLUSIVE, {}, "empty string makes no claim"
         all_offsets = []
         start = 0
         while True:
@@ -445,6 +456,9 @@ class Verifier:
         if "offset" not in p or "mnemonics" not in p:
             raise ClaimError("instructions requires 'offset' and 'mnemonics'")
         expected = [str(m).lower() for m in p["mnemonics"]]
+        if not expected:
+            # An empty instruction list is satisfied by every byte stream: no claim.
+            return INCONCLUSIVE, {}, "empty mnemonics makes no claim"
         arch = str(p.get("arch", "x86_64"))
         mode = str(p.get("mode", "exact"))
         length = _as_int(p["length"]) if "length" in p else None

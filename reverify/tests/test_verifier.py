@@ -212,5 +212,38 @@ class TestAggregateAndEdgeCases(unittest.TestCase):
         self.assertEqual(c.note, "header")
 
 
+class TestVacuousClaimsNeverVerify(unittest.TestCase):
+    """CONTRIBUTING: the verifier must never pass a claim that asserts nothing.
+
+    The empty string is a substring of every byte stream, an all-wildcard pattern
+    matches everywhere, zero bytes are equal everywhere, and an empty instruction
+    list is satisfied by any code. All four used to come back VERIFIED (with a
+    positive weight); they must now be refused instead.
+    """
+
+    def setUp(self):
+        self.v = Verifier(b"hello world")
+
+    def test_empty_string_present_is_not_verified(self):
+        r = self.v.verify(Claim("string_present", {"value": ""}))
+        self.assertEqual(r["verdict"], INCONCLUSIVE)
+
+    def test_all_wildcard_pattern_is_not_verified(self):
+        r = self.v.verify(Claim("pattern_present", {"pattern": "??"}))
+        self.assertEqual(r["verdict"], INCONCLUSIVE)
+
+    def test_empty_expected_bytes_is_not_verified(self):
+        r = self.v.verify(Claim("bytes_at", {"offset": 3, "expected": ""}))
+        self.assertEqual(r["verdict"], INCONCLUSIVE)
+
+    def test_zero_length_bytes_is_not_verified(self):
+        r = self.v.verify(Claim("bytes_at", {"offset": 3, "length": 0}))
+        self.assertEqual(r["verdict"], INCONCLUSIVE)
+
+    def test_empty_instructions_is_not_verified(self):
+        r = self.v.verify(Claim("instructions", {"offset": 0, "mnemonics": []}))
+        self.assertEqual(r["verdict"], INCONCLUSIVE)
+
+
 if __name__ == "__main__":
     unittest.main()

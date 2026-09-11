@@ -323,7 +323,12 @@ class PEParser:
 
         if names_offset and ordinals_offset and functions_offset:
             for i in range(num_names):
-                if names_offset + 4 > len(self.data) or ordinals_offset + 2 > len(self.data):
+                # Bounds must be checked per-iteration: the tables may be truncated
+                # mid-way, so a large num_names must not walk off the end of the file.
+                if (
+                    names_offset + i * 4 + 4 > len(self.data)
+                    or ordinals_offset + i * 2 + 2 > len(self.data)
+                ):
                     break
                 (n_rva,) = struct.unpack_from("<I", self.data, names_offset + i * 4)
                 (ord_idx,) = struct.unpack_from("<H", self.data, ordinals_offset + i * 2)

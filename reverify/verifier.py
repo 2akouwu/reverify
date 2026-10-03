@@ -749,6 +749,12 @@ class Verifier:
 
     def _check_import_present(self, p: Dict[str, Any]):
         """Claim: the binary imports ``function`` (optionally from ``lib``/``dll``). PE, ELF, Mach-O."""
+        allowed = {"function", "lib", "dll", "observe"}
+        unknown = sorted(set(p) - allowed)
+        if unknown:
+            raise ClaimError(
+                "import_present has unknown parameter(s): " + ", ".join(unknown)
+            )
         lib = p.get("lib", p.get("dll"))
         if "function" not in p and lib is None:
             raise ClaimError("import_present requires 'function' and/or 'lib'")

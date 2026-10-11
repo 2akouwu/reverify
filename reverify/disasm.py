@@ -198,7 +198,9 @@ def pattern_scan(data: bytes, pattern: str) -> List[int]:
             regex_parts.append(re.escape(bytes([byte_val])))
 
     regex = b"".join(regex_parts)
-    matches = [m.start() for m in re.finditer(regex, data, re.DOTALL)]
+    # Zero-width lookahead so overlapping hits count: "41 41" in b"AAAA" is at
+    # 0, 1 and 2, the same as string_present's occurrence count.
+    matches = [m.start() for m in re.finditer(b"(?=" + regex + b")", data, re.DOTALL)]
     return matches
 
 

@@ -29,6 +29,10 @@ class TestDisassembler(unittest.TestCase):
         matches = pattern_scan(data, pattern)
         self.assertEqual(matches, [0, 12])
 
+    def test_pattern_scan_counts_overlapping_matches(self):
+        self.assertEqual(pattern_scan(b"AAAA", "41 41"), [0, 1, 2])
+        self.assertEqual(pattern_scan(b"\xcc\xcc\xcc\xcc", "cc ?? cc"), [0, 1])
+
     def test_create_patch(self):
         orig = b"\x90\x90\x74\x05\x90\x90"
         patched = b"\x90\x90\xEB\x05\x90\x90"

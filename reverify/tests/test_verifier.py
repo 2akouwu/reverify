@@ -50,6 +50,17 @@ class TestPatternPresent(unittest.TestCase):
         r = Verifier(self.data).verify(Claim("pattern_present", {"pattern": "90 90", "offset": 0}))
         self.assertEqual(r["verdict"], REFUTED)
 
+    def test_overlapping_match_at_claimed_offset_verified(self):
+        r = Verifier(b"AAAA").verify(Claim("pattern_present", {"pattern": "41 41", "offset": 1}))
+        self.assertEqual(r["verdict"], VERIFIED)
+
+    def test_overlapping_matches_are_counted(self):
+        # "41 41" occurs 3 times in AAAA. Counting only non-overlapping hits
+        # VERIFIED the wrong claim count=2 and REFUTED the right one.
+        v = Verifier(b"AAAA")
+        self.assertEqual(v.verify(Claim("pattern_present", {"pattern": "41 41", "count": 2}))["verdict"], REFUTED)
+        self.assertEqual(v.verify(Claim("pattern_present", {"pattern": "41 41", "count": 3}))["verdict"], VERIFIED)
+
 
 class TestStringPresent(unittest.TestCase):
     def setUp(self):

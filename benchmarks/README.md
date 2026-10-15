@@ -17,6 +17,17 @@ python benchmarks/verifier_matrix.py --per-dir 25 --json matrix.json   --fail-on
 OPENAI_API_KEY=... python benchmarks/model_loop.py --per-dir 5 --json model.json     # optional
 ```
 
+To compare a model served by an OpenAI-compatible gateway, set all three variables. For example, [A2Agent](https://a2agent.me/) documents `https://a2agent.me/v1` as its base URL:
+
+```bash
+export OPENAI_API_KEY="your-a2agent-key"
+export OPENAI_BASE_URL="https://a2agent.me/v1"
+export OPENAI_MODEL="your-available-model-id"
+python benchmarks/model_loop.py --per-dir 5 --json model.json
+```
+
+The live benchmark consumes model tokens; choose a model that accepts the benchmark prompts and review the gateway usage afterwards.
+
 Each run writes a JSON record: the SHA-256 and size of every binary tested, every verdict,
 reverify/Python/platform/engine versions, and totals with a 95% Wilson upper bound. Sampling
 is deterministic (sorted paths, fixed stride; claim offsets from an RNG seeded by the file

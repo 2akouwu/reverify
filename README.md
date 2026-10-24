@@ -13,6 +13,7 @@
   <a href="https://scorecard.dev/viewer/?uri=github.com/2akouwu/reverify"><img src="https://api.scorecard.dev/projects/github.com/2akouwu/reverify/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/2akouwu/reverify" alt="MIT"></a>
   <img src="https://img.shields.io/github/stars/2akouwu/reverify?style=social" alt="Stars">
+  <a href="https://madewithrea.com/builds/reverify-mcp-server-that-verifies-ai-reverse-engineering-claims-agains"><img src="https://madewithrea.com/badges/featured.svg" alt="Featured on Made with REA" height="20"></a>
 </p>
 
 <p align="center">

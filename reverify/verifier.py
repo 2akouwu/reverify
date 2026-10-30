@@ -74,9 +74,67 @@ INVALIDATED = "INVALIDATED"
 
 _META_KEYS = ("kind", "note", "id", "depends_on", "observe")
 
+# Accepted kind-specific parameters. Unknown keys are rejected before a handler
+# runs: a misspelled optional field (``symbol`` for ``function``, ``counts`` for
+# ``count``) must not silently weaken a claim to one that can still be VERIFIED.
+_KIND_PARAMS = {
+    "bytes_at": frozenset({"offset", "expected", "length", "space"}),
+    "u16_at": frozenset({"offset", "expected", "endian", "space"}),
+    "u32_at": frozenset({"offset", "expected", "endian", "space"}),
+    "u64_at": frozenset({"offset", "expected", "endian", "space"}),
+    "pattern_present": frozenset({"pattern", "offset", "count", "space"}),
+    "string_present": frozenset({"value", "offset", "encoding", "space"}),
+    "instructions": frozenset({
+        "offset", "mnemonics", "length", "arch", "mode", "base", "operands", "space",
+    }),
+    "emulate_result": frozenset({
+        "offset", "code", "length", "arch", "base", "max_steps", "backend",
+        "expect_registers", "space",
+    }),
+    "behavior_equiv": frozenset({
+        "offset", "code", "length", "arch", "bits", "arg_regs", "ret_reg",
+        "candidate_code", "expr", "args", "inputs", "space",
+    }),
+    "prove_equiv": frozenset({"a", "expr", "b", "candidate", "bits", "args"}),
+    "exebench": frozenset({"c_source", "record", "test_cases", "cc"}),
+    "functions_equiv": frozenset({
+        "candidate", "candidate_c", "candidate_py", "reference", "reference_c",
+        "reference_py", "record", "test_cases", "lang", "cc", "nargs", "inputs",
+    }),
+    "protobuf_field": frozenset({
+        "field", "type", "value", "data", "offset", "length", "space",
+    }),
+    "import_present": frozenset({"function", "lib", "dll"}),
+    "pe_import": frozenset({"function", "lib", "dll"}),
+    "export_present": frozenset({"name"}),
+    "section_present": frozenset({"name", "virtual_address"}),
+    "function_at": frozenset({"offset", "name", "space"}),
+    "calls": frozenset({"from", "to", "space"}),
+    "references": frozenset({"to", "from", "space"}),
+    "reachable_from_entry": frozenset({"offset", "name", "space"}),
+}
+_COMMON_PARAMS = frozenset({"observe"})
+
 
 class ClaimError(Exception):
     """Raised when a claim is structurally malformed (missing required keys)."""
+
+
+def _validate_params(kind: str, params: Dict[str, Any]) -> None:
+    """Reject parameters the kind does not understand.
+
+    Ignoring an unknown key would silently weaken the claim it was meant to strengthen.
+    """
+    allowed = _KIND_PARAMS.get(kind)
+    if allowed is None:
+        return
+    accepted = allowed | _COMMON_PARAMS
+    unknown = sorted(set(params) - accepted)
+    if unknown:
+        raise ClaimError(
+            f"unknown parameter(s) for {kind}: {', '.join(repr(u) for u in unknown)}; "
+            f"accepted: {', '.join(sorted(accepted))}"
+        )
 
 
 @dataclass
@@ -231,6 +289,7 @@ class Verifier:
         if claim.observe:
             params["observe"] = True
         try:
+            _validate_params(claim.kind, params)
             verdict, evidence, detail = handler(params)
         except ClaimError as exc:
             return self._result(claim, INCONCLUSIVE, {}, f"malformed claim: {exc}")

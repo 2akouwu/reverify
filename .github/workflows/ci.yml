@@ -71,7 +71,7 @@ jobs:
           python benchmarks/prologue_prior.py --per-dir 40 --markdown | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the benchmark record (hashes, verdicts, tool versions)
         if: matrix.deps == 'full'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: benchmark-${{ matrix.os }}
           path: bench-*.json
@@ -91,7 +91,7 @@ jobs:
           cp benchmarks/corpus/build/manifest.json "corpus-manifest-${{ matrix.os }}.json"
       - name: Keep the corpus manifest (toolchain versions, flags, hashes)
         if: matrix.deps == 'full'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: corpus-${{ matrix.os }}
           path: |
@@ -108,7 +108,7 @@ jobs:
             --json "recon-${{ matrix.os }}-${{ matrix.deps }}.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the reconstruction record
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: recon-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.deps }}
           path: recon-*.json
@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: python benchmarks/verifier_matrix.py --per-dir 25 --json "matrix-${{ matrix.os }}-${{ matrix.deps }}.json" --fail-on-false-verified | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep the matrix record
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: matrix-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.deps }}
           path: matrix-*.json

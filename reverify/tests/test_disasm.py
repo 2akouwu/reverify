@@ -29,6 +29,20 @@ class TestDisassembler(unittest.TestCase):
         matches = pattern_scan(data, pattern)
         self.assertEqual(matches, [0, 12])
 
+    def test_pattern_scan_overlapping(self):
+        # issue #28: re.finditer resumes after each match and drops overlapping
+        # hits, so pattern_present reported a wrong offset/count. Wrapping the
+        # regex in a zero-width lookahead reports a match at every start position.
+        # "AA" (0x41 0x41) over b"AAAA" overlaps at 0,1,2.
+        self.assertEqual(pattern_scan(b"AAAA", "41 41"), [0, 1, 2])
+        # int3/nop padding: five consecutive 0xCC -> overlapping "CC CC" pairs.
+        pad = bytes.fromhex("554889e5ccccccccccc3")
+        self.assertEqual(pattern_scan(pad, "CC CC"), [4, 5, 6, 7])
+        # wildcard overlap.
+        self.assertEqual(pattern_scan(bytes.fromhex("413f413f41"), "41 ??"), [0, 2])
+        # empty pattern still matches at every position (unchanged behaviour).
+        self.assertEqual(pattern_scan(b"AB", ""), [0, 1, 2])
+
     def test_create_patch(self):
         orig = b"\x90\x90\x74\x05\x90\x90"
         patched = b"\x90\x90\xEB\x05\x90\x90"

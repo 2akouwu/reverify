@@ -50,6 +50,14 @@ class TestPatternPresent(unittest.TestCase):
         r = Verifier(self.data).verify(Claim("pattern_present", {"pattern": "90 90", "offset": 0}))
         self.assertEqual(r["verdict"], REFUTED)
 
+    def test_pattern_overlapping_count(self):
+        # issue #28: overlapping matches were dropped, giving a wrong count.
+        # b"AAAA" -> "41 41" overlaps at 0,1,2 (three matches).
+        r = Verifier(b"AAAA").verify(Claim("pattern_present", {"pattern": "41 41", "count": 3}))
+        self.assertEqual(r["verdict"], VERIFIED)
+        r2 = Verifier(b"AAAA").verify(Claim("pattern_present", {"pattern": "41 41", "count": 2}))
+        self.assertEqual(r2["verdict"], REFUTED)
+
 
 class TestStringPresent(unittest.TestCase):
     def setUp(self):

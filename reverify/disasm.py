@@ -197,7 +197,7 @@ def pattern_scan(data: bytes, pattern: str) -> List[int]:
             byte_val = int(t, 16)
             regex_parts.append(re.escape(bytes([byte_val])))
 
-    regex = b"".join(regex_parts)
+    regex = b"(?=" + b"".join(regex_parts) + b")"
     matches = [m.start() for m in re.finditer(regex, data, re.DOTALL)]
     return matches
 

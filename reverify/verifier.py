@@ -388,12 +388,13 @@ class Verifier:
             evidence["address"] = addr
             if want is None:
                 return INCONCLUSIVE, evidence, addr.get("error", "bad address")
-            ok = want in matches
-            return (VERIFIED if ok else REFUTED), evidence, (
-                "pattern present at claimed offset" if ok else "pattern not at claimed offset"
-            )
+            if want not in matches:
+                return REFUTED, evidence, "pattern not at claimed offset"
+            if "count" not in p:
+                return VERIFIED, evidence, "pattern present at claimed offset"
         if "count" in p:
             want = _as_int(p["count"])
+            evidence["expected_count"] = want
             ok = len(matches) == want
             return (VERIFIED if ok else REFUTED), evidence, f"expected {want} matches, found {len(matches)}"
         if matches:

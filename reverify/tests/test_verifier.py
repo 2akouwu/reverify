@@ -177,6 +177,32 @@ class TestPeImport(unittest.TestCase):
         self.assertEqual(r["verdict"], REFUTED)
 
 
+class TestPatternPresentOffsetAndCount(unittest.TestCase):
+    def test_offset_and_count_both_match_verified(self):
+        data = b"AAXXAA"
+        r = Verifier(data).verify(
+            Claim("pattern_present", {"pattern": "41 41", "offset": 0, "count": 2})
+        )
+        self.assertEqual(r["verdict"], VERIFIED)
+        self.assertEqual(r["evidence"]["match_count"], 2)
+        self.assertEqual(r["evidence"]["expected_count"], 2)
+
+    def test_issue_37_offset_matches_but_count_differs_refuted(self):
+        # issue #37: count was ignored whenever offset was also supplied.
+        r = Verifier(b"AAAABCD").verify(
+            Claim("pattern_present", {"pattern": "41 41", "offset": 0, "count": 999})
+        )
+        self.assertEqual(r["verdict"], REFUTED)
+        self.assertEqual(r["evidence"]["expected_count"], 999)
+
+    def test_offset_and_count_both_mismatch_refuted(self):
+        data = b"AAXXAA"
+        r = Verifier(data).verify(
+            Claim("pattern_present", {"pattern": "41 41", "offset": 1, "count": 999})
+        )
+        self.assertEqual(r["verdict"], REFUTED)
+
+
 class TestAggregateAndEdgeCases(unittest.TestCase):
     def test_verify_all_summary(self):
         data = bytes.fromhex("deadbeef")

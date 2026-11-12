@@ -7,7 +7,7 @@ tools_root = Path(__file__).resolve().parent.parent
 if str(tools_root) not in sys.path:
     sys.path.insert(0, str(tools_root))
 
-from verifier import Claim, Verifier, INCONCLUSIVE, REFUTED
+from verifier import Claim, Verifier, INCONCLUSIVE, REFUTED, VERIFIED
 
 
 def _synthetic_pe_no_imports() -> bytes:
@@ -66,6 +66,20 @@ class TestImportClaimSchema(unittest.TestCase):
         )
         self.assertEqual(r["verdict"], INCONCLUSIVE)
         self.assertIn("symbol", r["detail"])
+
+
+class _ExtendedVerifier(Verifier):
+    def _check_extended_kind(self, p):
+        return VERIFIED, {}, "extended kind"
+
+
+class TestUnlistedClaimKind(unittest.TestCase):
+    def test_unlisted_kind_is_not_subject_to_the_allowlist(self):
+        r = _ExtendedVerifier(b"").verify(
+            Claim("extended_kind", {"any_parameter": "accepted"})
+        )
+        self.assertEqual(r["verdict"], VERIFIED)
+        self.assertEqual(r["detail"], "extended kind")
 
 
 class TestRelatedClaimSchemas(unittest.TestCase):

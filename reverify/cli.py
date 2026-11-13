@@ -19,6 +19,7 @@ try:  # installed package (e.g. the ``reverify`` console script)
     from .disasm import Disassembler, pattern_scan, create_patch
     from .emulator import MicroEmulator, make_emulator
     from .binary import parse_binary
+    from .apk import inspect_apk
     from .backends import backend_report
     from .protocol_parser import ProtobufDissector, TLVDissector, format_hexdump
     from .frida_bridge import FridaScriptGenerator
@@ -35,6 +36,7 @@ except ImportError:  # run directly as a script: ``python reverify/cli.py ...``
     from disasm import Disassembler, pattern_scan, create_patch
     from emulator import MicroEmulator, make_emulator
     from binary import parse_binary
+    from apk import inspect_apk
     from backends import backend_report
     from protocol_parser import ProtobufDissector, TLVDissector, format_hexdump
     from frida_bridge import FridaScriptGenerator
@@ -105,7 +107,12 @@ def auto_triage(data: bytes, filename: str = "") -> Dict[str, Any]:
         if info.error:
             report["parse_error"] = info.error
     elif data.startswith(b"PK\x03\x04"):
-        report["type"] = "ZIP Archive / Package"
+        apk = inspect_apk(data)
+        if apk.get("is_apk"):
+            report["type"] = "Android APK"
+            report["apk"] = apk
+        else:
+            report["type"] = "ZIP Archive / Package"
     else:
         report["type"] = "Raw Binary / Memory Dump / Protocol Stream"
         # Try Protobuf
@@ -200,6 +207,8 @@ def cmd_auto(args: argparse.Namespace) -> None:
             print(f"Architecture: {b['arch']} ({b['bits']}-bit)  [parser: {b['backend']}]")
             print(f"Sections: {', '.join(report.get('sections', []))}")
             print(f"Imported libs: {', '.join(b.get('imported_libs', []))}")
+        if "apk" in report:
+            _print_apk_report(report["apk"])
         if "top_strings" in report and report["top_strings"]:
             print(f"Strings Preview: {', '.join(report['top_strings'][:8])}")
 
@@ -241,6 +250,50 @@ def cmd_parse(args: argparse.Namespace) -> None:
         print(f"Exports:      {s['export_count']}")
         if s.get("error"):
             print(f"Note:         {s['error']}")
+
+
+def _print_apk_report(report: Dict[str, Any]) -> None:
+    manifest = report.get("manifest") or {}
+    print(f"=== APK: {report.get('size', 0)} bytes, {report.get('entries', 0)} entries ===")
+    print(f"Package:      {manifest.get('package')}")
+    print(f"Version:      {manifest.get('version_name')} (code {manifest.get('version_code')})")
+    print(f"SDK:          min {manifest.get('min_sdk')} / target {manifest.get('target_sdk')}")
+    permissions = manifest.get("permissions") or []
+    print(f"Permissions:  {len(permissions)}{': ' + ', '.join(permissions) if permissions else ''}")
+    activities = manifest.get("activities") or []
+    for activity in activities[:12]:
+        categories = []
+        for intent_filter in activity.get("intent_filters", []):
+            categories.extend(intent_filter.get("categories", []))
+        suffix = f" [{', '.join(categories)}]" if categories else ""
+        print(f"  activity:   {activity.get('resolved_name')}{suffix}")
+    if len(activities) > 12:
+        print(f"  ... {len(activities) - 12} more activities")
+    for dex in report.get("dex", []):
+        if dex.get("error"):
+            print(f"DEX:          {dex.get('name')}: {dex['error']}")
+        else:
+            print(f"DEX:          {dex.get('name')}: {dex.get('class_count')} classes, {dex.get('method_count')} methods")
+    signing = report.get("signing") or {}
+    schemes = signing.get("schemes") or []
+    print(f"Signing:      {', '.join(schemes) if schemes else 'none'}")
+    for cert in signing.get("certificates", []):
+        print(f"  cert SHA-256: {cert['sha256']} ({', '.join(cert.get('schemes', []))})")
+    if report.get("manifest_error"):
+        print(f"Manifest note: {report['manifest_error']}")
+    if report.get("error"):
+        print(f"APK note:      {report['error']}")
+
+
+def cmd_parse_apk(args: argparse.Namespace) -> None:
+    data = load_input_bytes(args.file)
+    report = inspect_apk(data)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    elif not report.get("is_apk"):
+        print("Not an APK: expected a ZIP containing AndroidManifest.xml and classes*.dex")
+    else:
+        _print_apk_report(report)
 
 
 def cmd_backends(args: argparse.Namespace) -> None:
@@ -636,6 +689,12 @@ def main() -> None:
     p_parse.add_argument("--backend", default="auto", choices=["auto", "lief", "pure"], help="Parsing engine")
     p_parse.add_argument("--json", action="store_true", help="Output full JSON structure")
     p_parse.set_defaults(func=cmd_parse)
+
+    # parse-apk
+    p_apk = subparsers.add_parser("parse-apk", help="Inspect an APK: manifest, DEX classes/methods, signing certificates")
+    p_apk.add_argument("file", help="Path to the APK")
+    p_apk.add_argument("--json", action="store_true", help="Output full JSON structure")
+    p_apk.set_defaults(func=cmd_parse_apk)
 
     # backends
     p_be = subparsers.add_parser("backends", help="Show which engines are active (capstone / unicorn / lief)")

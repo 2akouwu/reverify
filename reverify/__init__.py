@@ -6,6 +6,7 @@ from .pe_parser import PEParser, BinaryParseError
 from .disasm import Disassembler, Instruction, pattern_scan, create_patch
 from .emulator import MicroEmulator, UnicornEmulator, make_emulator, EmulatorError
 from .binary import parse_binary, BinaryInfo, Section
+from .apk import is_apk, inspect_apk, decode_axml, parse_dex, signing_report
 from .backends import backend_report, HAS_CAPSTONE, HAS_UNICORN, HAS_LIEF
 from .protocol_parser import ProtobufDissector, TLVDissector, format_hexdump, decode_varint, encode_varint
 from .frida_bridge import FridaScriptGenerator
@@ -33,6 +34,11 @@ __all__ = [
     "parse_binary",
     "BinaryInfo",
     "Section",
+    "is_apk",
+    "inspect_apk",
+    "decode_axml",
+    "parse_dex",
+    "signing_report",
     "backend_report",
     "HAS_CAPSTONE",
     "HAS_UNICORN",

@@ -6,6 +6,12 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- **APK awareness.** `reverify auto` recognizes an APK (a ZIP with `AndroidManifest.xml`
+  and `classes*.dex`) instead of a generic ZIP. `parse-apk` and the `apk_manifest`,
+  `apk_class_present`, `apk_method_present` and `apk_signing_certificate` claims decode
+  the binary manifest, enumerate DEX classes and methods, and report v1/v2/v3 (and v3.1
+  when present) signer certificate SHA-256 digests. `resources.arsc`, native libraries
+  and full signature verification stay out of scope.
 - **Lean, not just cleared.** The `instructions` snippet and the README now state the honest
   contract for a plain `claude` / `codex` session: keep the conversation lean (bulky output to
   re-readable files, local edits, subagents for exploration) and keep the hand-off current; a fresh

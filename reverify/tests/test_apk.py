@@ -26,7 +26,7 @@ from apk import (  # noqa: E402
     parse_dex,
 )
 import apk as apk_module  # noqa: E402
-from cli import auto_triage, cmd_auto, cmd_parse_apk  # noqa: E402
+from cli import _print_results, auto_triage, cmd_auto, cmd_parse_apk  # noqa: E402
 from verifier import (  # noqa: E402
     Claim,
     INCONCLUSIVE,
@@ -254,6 +254,57 @@ def synthetic_dex() -> bytes:
     return bytes(body)
 
 
+def synthetic_dex_two_classes(with_field: bool = False) -> bytes:
+    strings = ["Lcom/example/A;", "Lcom/example/B;", "Ljava/lang/Object;", "greet", "()V", "V"]
+    string_ids_off = 0x70
+    type_ids_off = string_ids_off + len(strings) * 4
+    proto_ids_off = type_ids_off + 4 * 4
+    method_ids_off = proto_ids_off + 12
+    class_defs_off = method_ids_off + 8
+    data_off = class_defs_off + 2 * 32
+    string_data = bytearray()
+    string_offsets = []
+    for value in strings:
+        string_offsets.append(data_off + len(string_data))
+        string_data += _uleb(len(value)) + value.encode("utf-8") + b"\x00"
+    class_head = bytes([1, 0, 1, 0]) + _uleb(0) + _uleb(0) if with_field else bytes([0, 0, 1, 0])
+    class_data1 = class_head + _uleb(0) + _uleb(1) + _uleb(0)
+    class_data2 = class_head + _uleb(0) + _uleb(1) + _uleb(0)
+    class_data1_off = data_off + len(string_data)
+    class_data2_off = class_data1_off + len(class_data1)
+
+    header = bytearray(0x70)
+    header[0:8] = b"dex\n035\x00"
+    struct.pack_into("<I", header, 32, class_data2_off + len(class_data2))
+    struct.pack_into("<I", header, 36, 0x70)
+    struct.pack_into("<I", header, 40, 0x12345678)
+    struct.pack_into("<I", header, 56, len(strings))
+    struct.pack_into("<I", header, 60, string_ids_off)
+    struct.pack_into("<I", header, 64, 4)
+    struct.pack_into("<I", header, 68, type_ids_off)
+    struct.pack_into("<I", header, 72, 1)
+    struct.pack_into("<I", header, 76, proto_ids_off)
+    struct.pack_into("<I", header, 88, 1)
+    struct.pack_into("<I", header, 92, method_ids_off)
+    struct.pack_into("<I", header, 96, 2)
+    struct.pack_into("<I", header, 100, class_defs_off)
+    struct.pack_into("<I", header, 104, len(string_data) + len(class_data1) + len(class_data2))
+    struct.pack_into("<I", header, 108, data_off)
+
+    body = bytearray(header)
+    for offset in string_offsets:
+        body += struct.pack("<I", offset)
+    body += struct.pack("<IIII", 0, 1, 2, 5)  # types: A, B, Object, V
+    body += struct.pack("<III", 5, 3, 0)  # shorty "V", return type "V", no params
+    body += struct.pack("<HHI", 0, 0, 3)  # A.greet
+    for class_idx, class_data_off in ((0, class_data1_off), (1, class_data2_off)):
+        body += struct.pack("<IIIIIIII", class_idx, 1, 2, 0, 0xFFFFFFFF, 0, class_data_off, 0)
+    body += string_data
+    body += class_data1
+    body += class_data2
+    return bytes(body)
+
+
 def _lp(value: bytes) -> bytes:
     return struct.pack("<I", len(value)) + value
 
@@ -466,6 +517,39 @@ class TestDex(unittest.TestCase):
             with self.assertRaises(ApkError):
                 parse_dex(synthetic_dex())
 
+    def test_method_descriptor_budget_is_shared_across_classes(self):
+        data = synthetic_dex_two_classes()
+        self.assertEqual(len(parse_dex(data)["classes"]), 2)
+        # Each class uses a 3-byte descriptor; a per-class budget of 4 would
+        # accept both, so this only fails when the budget is per DEX.
+        with mock.patch.object(apk_module, "_MAX_METHOD_DESCRIPTORS", 4):
+            with self.assertRaises(ApkError):
+                parse_dex(data)
+
+    def test_method_budget_is_shared_across_classes(self):
+        with mock.patch.object(apk_module, "_MAX_DEX_METHODS", 1):
+            with self.assertRaises(ApkError):
+                parse_dex(synthetic_dex_two_classes())
+
+    def test_field_budget_is_shared_across_classes(self):
+        with mock.patch.object(apk_module, "_MAX_DEX_FIELDS", 1):
+            with self.assertRaises(ApkError):
+                parse_dex(synthetic_dex_two_classes(with_field=True))
+
+    def test_dex_proto_index_must_be_in_table(self):
+        data = bytearray(synthetic_dex())
+        method_off = struct.unpack_from("<I", data, 92)[0]
+        struct.pack_into("<H", data, method_off + 2, 1)  # proto table has one entry
+        with self.assertRaises(ApkError):
+            parse_dex(bytes(data))
+
+    def test_dex_method_class_index_must_be_in_table(self):
+        data = bytearray(synthetic_dex())
+        method_off = struct.unpack_from("<I", data, 92)[0]
+        struct.pack_into("<H", data, method_off, 99)  # type table has three entries
+        with self.assertRaises(ApkError):
+            parse_dex(bytes(data))
+
 
 class TestApkInspection(unittest.TestCase):
     def test_detect_and_decode(self):
@@ -544,6 +628,37 @@ class TestApkInspection(unittest.TestCase):
                                  "params": {"sha256": hashlib.sha256(cert_der()).hexdigest(),
                                             "present": False}})
         self.assertEqual(verifier.verify(claim)["verdict"], INCONCLUSIVE)
+
+    def test_zip64_central_directory_is_not_reported_as_unsigned(self):
+        data = bytearray(synthetic_apk(v2=True))
+        eocd = _find_eocd(data)
+        struct.pack_into("<I", data, eocd + 16, 0xFFFFFFFF)
+        with self.assertRaises(ApkError):
+            apk_module._apk_signing_pairs(bytes(data))
+
+    def test_entry_size_lie_is_bounded(self):
+        class Info:
+            file_size = 1
+
+        class Handle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n):
+                return b"x" * (n + 10)
+
+        class Zip:
+            def getinfo(self, name):
+                return Info()
+
+            def open(self, name):
+                return Handle()
+
+        with self.assertRaises(ApkError):
+            apk_module._read_entry(Zip(), "AndroidManifest.xml", 4)
 
     def test_truncated_manifest_does_not_verify_absence(self):
         axml = synthetic_manifest_axml()[:100]
@@ -625,6 +740,26 @@ class TestApkCli(unittest.TestCase):
             cmd_parse_apk(args)
         self.assertIn("Signing:      unavailable", out.getvalue())
 
+    def test_observed_claims_print_the_data(self):
+        verifier = Verifier(synthetic_apk(v2=True))
+        results = [
+            verifier.verify(Claim.from_dict({
+                "kind": "apk_manifest", "params": {"field": "permissions", "observe": True}})),
+            verifier.verify(Claim.from_dict({
+                "kind": "apk_manifest", "params": {"field": "activity", "observe": True}})),
+            verifier.verify(Claim.from_dict({
+                "kind": "apk_signing_certificate",
+                "params": {"sha256": "00" * 32, "observe": True}})),
+        ]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _print_results(results)
+        text = out.getvalue()
+        self.assertIn("android.permission.INTERNET", text)
+        self.assertIn("com.example.tv.MainActivity", text)
+        self.assertIn(hashlib.sha256(cert_der()).hexdigest(), text)
+        self.assertNotIn("observed: None", text)
+
 
 class TestApkClaims(unittest.TestCase):
     def setUp(self):
@@ -676,6 +811,14 @@ class TestApkClaims(unittest.TestCase):
                             expected=[".MainActivity", ".Missing"], present=False)
         self.assertEqual(result["verdict"], REFUTED)
 
+    def test_missing_activity_cannot_satisfy_an_absence_claim(self):
+        result = self.claim("apk_manifest", field="activity_category",
+                            activity=".Missing",
+                            expected="android.intent.category.LEANBACK_LAUNCHER",
+                            present=False)
+        self.assertEqual(result["verdict"], REFUTED)
+        self.assertFalse(result["evidence"]["activity_found"])
+
     def test_relative_activity_name_resolves_against_package(self):
         apk = synthetic_apk(manifest_axml=synthetic_manifest_axml(
             activity_name="com.example.tv.MainActivity"))
@@ -719,6 +862,9 @@ class TestApkClaims(unittest.TestCase):
         self.assertEqual(result["verdict"], REFUTED)
         result = self.claim("apk_signing_certificate", sha256="00" * 32)
         self.assertEqual(result["verdict"], REFUTED)
+        result = self.claim("apk_signing_certificate", sha256=digest, scheme="v9")
+        self.assertEqual(result["verdict"], INCONCLUSIVE)
+        self.assertIn("scheme", result["detail"])
 
     def test_unsigned_apk_absence(self):
         verifier = Verifier(synthetic_apk())

@@ -164,8 +164,14 @@ def _apk_bool(value: Any, name: str) -> bool:
 
 
 def _apk_scalar_match(actual: Any, expected: Any) -> bool:
+    if actual is None:
+        # An absent field cannot satisfy a claim; otherwise "None" would match
+        # a missing minSdk/targetSdk and become a false VERIFIED.
+        return False
     if isinstance(actual, bool):
-        return bool(expected) is actual
+        if isinstance(expected, bool):
+            return expected is actual
+        return str(expected).strip().lower() == ("true" if actual else "false")
     if isinstance(actual, int):
         try:
             return int(str(expected), 0) == actual
@@ -1106,7 +1112,7 @@ class Verifier:
 
         if field in ("permission", "permissions"):
             values = list(manifest.get("permissions") or [])
-            evidence = {"field": field, "permissions": values}
+            evidence = {"field": field, "permissions": values, "actual": values}
             if p.get("observe"):
                 return OBSERVED, evidence, f"{len(values)} permissions read"
             if "expected" not in p and "value" not in p:
@@ -1132,7 +1138,7 @@ class Verifier:
                 for key in ("name", "resolved_name"):
                     if activity.get(key):
                         names.append(str(activity[key]))
-            evidence = {"field": field, "activities": names}
+            evidence = {"field": field, "activities": names, "actual": names}
             if p.get("observe"):
                 return OBSERVED, evidence, f"{len(names)} activity names read"
             if "expected" not in p and "value" not in p:
@@ -1159,14 +1165,19 @@ class Verifier:
             activity_filter = p.get("activity")
             package = manifest.get("package")
             categories: List[str] = []
+            activity_found = False
             for activity in activities:
                 names = {_apk_class_name(activity.get("name") or ""),
                          _apk_class_name(activity.get("resolved_name") or "")}
                 if activity_filter and _apk_resolve_name(activity_filter, package) not in names:
                     continue
+                activity_found = True
                 for intent_filter in activity.get("intent_filters", []):
                     categories.extend(str(c) for c in intent_filter.get("categories") or [])
-            evidence = {"field": field, "activity": activity_filter, "categories": categories}
+            evidence = {"field": field, "activity": activity_filter, "categories": categories,
+                        "actual": categories}
+            if activity_filter:
+                evidence["activity_found"] = activity_found
             if p.get("observe"):
                 return OBSERVED, evidence, f"{len(categories)} categories read"
             if "expected" not in p and "value" not in p:
@@ -1174,6 +1185,16 @@ class Verifier:
             expected = p.get("expected", p.get("value"))
             present = _apk_bool(p.get("present", True), "present")
             asked = {str(v) for v in expected} if isinstance(expected, (list, tuple, set)) else {str(expected)}
+            if activity_filter and not activity_found:
+                # A missing activity would otherwise make an absence claim
+                # vacuously VERIFIED; refuse to certify a component that is
+                # not there at all.
+                evidence["expected"] = expected
+                evidence["present"] = present
+                evidence["found"] = False
+                return REFUTED, evidence, (
+                    f"activity {activity_filter!r} is not declared in the manifest"
+                )
             found = (asked <= set(categories)) if present else bool(asked & set(categories))
             evidence.update({"expected": expected, "present": present, "found": found})
             ok = found if present else not found
@@ -1219,6 +1240,7 @@ class Verifier:
             "present": present,
             "found": bool(matches),
             "matches": [c.get("name") for c in matches[:20]],
+            "actual": [c.get("name") for c in matches[:20]],
         }
         if errors:
             evidence["dex_errors"] = errors
@@ -1271,6 +1293,7 @@ class Verifier:
             "present": present,
             "found": bool(matches),
             "matches": matches[:20],
+            "actual": matches[:20],
         }
         if errors:
             evidence["dex_errors"] = errors
@@ -1295,6 +1318,10 @@ class Verifier:
         if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
             raise ClaimError("'sha256' must be a 64-character hex digest")
         scheme = str(p["scheme"]).lower() if "scheme" in p else None
+        if scheme is not None and scheme not in ("v1", "v2", "v3", "v3.1"):
+            # An unknown scheme would match nothing and could verify an
+            # absence claim by typo.
+            raise ClaimError("'scheme' must be v1, v2, v3 or v3.1")
         present = _apk_bool(p.get("present", True), "present")
         apk, bad = self._apk_or_inconclusive()
         if bad:
@@ -1322,6 +1349,7 @@ class Verifier:
             "chain_certificates": [{"sha256": c.get("sha256"), "schemes": c.get("schemes") or []}
                                    for c in signing.get("chain_certificates", [])],
         }
+        evidence["actual"] = evidence["certificates"]
         if errors:
             evidence["signing_errors"] = errors
         if p.get("observe"):

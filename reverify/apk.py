@@ -26,9 +26,12 @@ _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_DEX_BYTES = 256 * 1024 * 1024
 _MAX_SIGNATURE_BYTES = 64 * 1024 * 1024
 _MAX_DECODED_STRINGS = 64 * 1024 * 1024
+_MAX_DEX_STRINGS = 2 * 1024 * 1024
 _MAX_PROTO_PARAMS = 4096
 _MAX_METHOD_DESCRIPTOR = 64 * 1024
 _MAX_METHOD_DESCRIPTORS = 16 * 1024 * 1024
+_MAX_DEX_METHODS = 256 * 1024
+_MAX_DEX_FIELDS = 256 * 1024
 
 # Chunk types from frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h
 _RES_STRING_POOL_TYPE = 0x0001
@@ -72,7 +75,13 @@ def _read_entry(zf: zipfile.ZipFile, name: str, limit: int) -> bytes:
     info = zf.getinfo(name)
     if info.file_size > limit:
         raise ApkError("entry %s is %d bytes (limit %d)" % (name, info.file_size, limit))
-    return zf.read(name)
+    # Do not trust the size stored in the central directory: read one byte past
+    # the budget and fail if the stream really produces more.
+    with zf.open(name) as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ApkError("entry %s exceeds %d bytes when decompressed" % (name, limit))
+    return data
 
 
 # -- AXML ------------------------------------------------------------------
@@ -105,6 +114,8 @@ def _parse_string_pool(data: bytes, off: int = 0) -> List[str]:
         raise ApkError("not a string pool chunk")
     header_size = _u16(data, off + 2)
     chunk_size = _u32(data, off + 4)
+    if header_size < 28 or chunk_size < header_size:
+        raise ApkError("short string pool header")
     end = min(off + chunk_size, len(data))
     count = _u32(data, off + 8)
     flags = _u32(data, off + 16)
@@ -409,6 +420,12 @@ def _mutf8(raw: bytes) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
+def _dex_table(data: bytes, off: int, count: int, width: int, label: str) -> None:
+    """Reject an index table that cannot fit in the file before iterating it."""
+    if off > len(data) or count > (len(data) - off) // width:
+        raise ApkError("DEX %s table is out of range" % label)
+
+
 def _dex_strings(data: bytes, string_ids_off: int, count: int) -> List[str]:
     strings: List[str] = []
     decoded_bytes = 0
@@ -439,7 +456,10 @@ def _type_descriptor(types: List[str], type_idx: int) -> str:
     raise ApkError("DEX type index out of range")
 
 
-def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_idx: int) -> str:
+def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_count: int,
+                      proto_idx: int) -> str:
+    if not 0 <= proto_idx < proto_count:
+        raise ApkError("DEX prototype index out of range")
     base = proto_ids_off + proto_idx * 12
     return_type_idx = _u32(data, base + 4)
     params_off = _u32(data, base + 8)
@@ -448,6 +468,8 @@ def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_i
         size = _u32(data, params_off)
         if size > _MAX_PROTO_PARAMS:
             raise ApkError("DEX prototype has too many parameters")
+        if params_off + 4 + size * 2 > len(data):
+            raise ApkError("DEX prototype out of range")
         for i in range(size):
             params.append(_type_descriptor(types, _u16(data, params_off + 4 + i * 2)))
     return_type = _type_descriptor(types, return_type_idx)
@@ -458,7 +480,9 @@ def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_i
 
 
 def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int, int, str]],
-                   types: List[str], proto_ids_off: int) -> List[Dict[str, Any]]:
+                   types: List[str], proto_ids_off: int, proto_count: int,
+                   descriptor_budget: List[int], method_budget: List[int],
+                   field_budget: List[int]) -> List[Dict[str, Any]]:
     if class_data_off == 0:
         return []  # the valid "class has no data" encoding
     if class_data_off >= len(data):
@@ -470,12 +494,14 @@ def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int,
     virtual_methods, p = _uleb128(data, p)
     if static_fields + instance_fields > 0x10000 or direct_methods + virtual_methods > 0x10000:
         raise ApkError("DEX class_data member count out of range")
+    field_budget[0] -= static_fields + instance_fields
+    if field_budget[0] < 0:
+        raise ApkError("DEX field declarations exceed budget")
     for _ in range(static_fields + instance_fields):
         _, p = _uleb128(data, p)
         _, p = _uleb128(data, p)
 
     methods: List[Dict[str, Any]] = []
-    descriptor_bytes = 0
     for count in (direct_methods, virtual_methods):
         method_idx = 0
         for _ in range(count):
@@ -485,10 +511,13 @@ def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int,
             _, p = _uleb128(data, p)  # code_off
             if not 0 <= method_idx < len(method_ids):
                 raise ApkError("DEX method index out of range")
+            method_budget[0] -= 1
+            if method_budget[0] < 0:
+                raise ApkError("DEX method declarations exceed budget")
             _, proto_idx, name = method_ids[method_idx]
-            descriptor = _proto_descriptor(data, types, proto_ids_off, proto_idx)
-            descriptor_bytes += len(descriptor)
-            if descriptor_bytes > _MAX_METHOD_DESCRIPTORS:
+            descriptor = _proto_descriptor(data, types, proto_ids_off, proto_count, proto_idx)
+            descriptor_budget[0] -= len(descriptor)
+            if descriptor_budget[0] < 0:
                 raise ApkError("DEX method descriptors exceed budget")
             methods.append({
                 "name": name,
@@ -510,13 +539,22 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
     string_off = _u32(data, 60)
     type_count = _u32(data, 64)
     type_off = _u32(data, 68)
+    proto_count = _u32(data, 72)
     proto_off = _u32(data, 76)
     method_count = _u32(data, 88)
     method_off = _u32(data, 92)
     class_count = _u32(data, 96)
     class_off = _u32(data, 100)
-    if type_count > 0x10000 or method_count > 0x10000 or class_count > 0x10000:
+    if (type_count > 0x10000 or proto_count > 0x10000
+            or method_count > 0x10000 or class_count > 0x10000):
         raise ApkError("DEX index table exceeds 16-bit indices")
+    if string_count > _MAX_DEX_STRINGS:
+        raise ApkError("DEX string count exceeds budget")
+    _dex_table(data, string_off, string_count, 4, "string_ids")
+    _dex_table(data, type_off, type_count, 4, "type_ids")
+    _dex_table(data, proto_off, proto_count, 12, "proto_ids")
+    _dex_table(data, method_off, method_count, 8, "method_ids")
+    _dex_table(data, class_off, class_count, 32, "class_defs")
 
     strings = _dex_strings(data, string_off, string_count)
     types = []
@@ -532,12 +570,17 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
         class_idx = _u16(data, base)
         proto_idx = _u16(data, base + 2)
         name_idx = _u32(data, base + 4)
+        if class_idx >= len(types) or proto_idx >= proto_count:
+            raise ApkError("DEX method reference out of range")
         if name_idx >= len(strings):
             raise ApkError("DEX method name index out of range")
         method_ids.append((class_idx, proto_idx, strings[name_idx]))
 
     classes: List[Dict[str, Any]] = []
     total_methods = 0
+    descriptor_budget = [_MAX_METHOD_DESCRIPTORS]
+    method_budget = [_MAX_DEX_METHODS]
+    field_budget = [_MAX_DEX_FIELDS]
     for i in range(class_count):
         base = class_off + i * 32
         class_idx = _u32(data, base)
@@ -545,7 +588,8 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
         superclass_idx = _u32(data, base + 8)
         class_data_off = _u32(data, base + 24)
         descriptor = _type_descriptor(types, class_idx)
-        methods = _class_methods(data, class_data_off, method_ids, types, proto_off)
+        methods = _class_methods(data, class_data_off, method_ids, types, proto_off,
+                                 proto_count, descriptor_budget, method_budget, field_budget)
         total_methods += len(methods)
         superclass = None
         if superclass_idx != 0xFFFFFFFF:
@@ -670,8 +714,12 @@ def _apk_signing_pairs(data: bytes) -> Dict[int, List[bytes]]:
     if eocd is None:
         return {}
     central_dir_off = _u32(data, eocd + 16)
+    if central_dir_off == 0xFFFFFFFF:
+        # ZIP64 puts the real offset in a separate record; reporting "no
+        # signature" from the sentinel would turn an unknown into an absence.
+        raise ApkError("ZIP64 APK signing block is not supported")
     if central_dir_off < 24 or central_dir_off > len(data):
-        return {}
+        raise ApkError("APK central directory offset is out of range")
     if data[central_dir_off - 16 : central_dir_off] != APK_SIG_BLOCK_MAGIC:
         return {}  # no signing block at all
     size = _u64(data, central_dir_off - 24)

@@ -555,7 +555,11 @@ def _print_results(results: List[Dict[str, Any]]) -> None:
         print(f"           {r['detail']}")
         ev = r.get("evidence") or {}
         if r["verdict"] == "OBSERVED":
-            val = ev.get("actual") or ev.get("registers") or ev.get("raw")
+            val = ev.get("actual")
+            if val is None:
+                val = ev.get("registers")
+            if val is None:
+                val = ev.get("raw")
             print(f"           observed: {val}")
         elif r["verdict"] == "REFUTED" and ev.get("nearest_offset_of_expected"):
             print(f"           expected bytes actually at: {ev['nearest_offset_of_expected']}")

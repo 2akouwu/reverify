@@ -510,6 +510,17 @@ class TestApkInspection(unittest.TestCase):
         self.assertEqual(verifier.verify(leaf)["verdict"], VERIFIED)
         self.assertEqual(verifier.verify(issuer)["verdict"], REFUTED)
 
+    def test_orphan_v1_block_is_not_a_signature(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("AndroidManifest.xml", synthetic_manifest_axml())
+            zf.writestr("classes.dex", synthetic_dex())
+            zf.writestr("META-INF/ORPHAN.RSA", _pkcs7(cert_der()))
+        report = inspect_apk(buffer.getvalue())
+        self.assertFalse(report["signing"]["v1"]["present"])
+        self.assertEqual(report["signing"]["schemes"], [])
+        self.assertEqual(report["signing"]["certificates"], [])
+
     def test_v1_chain_certificate_is_not_signer(self):
         chain = cert_der(b"\x2b")
         report = inspect_apk(synthetic_apk(v1=True, chain_cert=chain))

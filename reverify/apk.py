@@ -599,7 +599,7 @@ def _signer_certs(blob: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
     """
     certs = _parse_certs(blob)
     if not certs:
-        return [], []
+        raise ApkError("signer has no certificates")
     return [_public_cert(certs[0])], [_public_cert(c) for c in certs[1:]]
 
 
@@ -818,12 +818,17 @@ def _v1_report(zf: zipfile.ZipFile, names: List[str]) -> Dict[str, Any]:
         n for n in names
         if n.upper().startswith("META-INF/") and n.upper().endswith((".RSA", ".DSA", ".EC"))
     )
-    present = bool(sf_files and block_files)
+    def stem(name: str) -> str:
+        return name.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+
+    sf_stems = {stem(name) for name in sf_files}
+    matched_blocks = [name for name in block_files if stem(name) in sf_stems]
+    present = bool(matched_blocks)
     certs: List[Dict[str, Any]] = []
     chain: List[Dict[str, Any]] = []
     errors: List[str] = []
     if present:
-        for name in block_files:
+        for name in matched_blocks:
             try:
                 signer, extra = _v1_certificates(_read_entry(zf, name, _MAX_SIGNATURE_BYTES))
                 certs.extend(signer)

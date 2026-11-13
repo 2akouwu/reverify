@@ -26,6 +26,9 @@ _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_DEX_BYTES = 256 * 1024 * 1024
 _MAX_SIGNATURE_BYTES = 64 * 1024 * 1024
 _MAX_DECODED_STRINGS = 64 * 1024 * 1024
+_MAX_PROTO_PARAMS = 4096
+_MAX_METHOD_DESCRIPTOR = 64 * 1024
+_MAX_METHOD_DESCRIPTORS = 16 * 1024 * 1024
 
 # Chunk types from frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h
 _RES_STRING_POOL_TYPE = 0x0001
@@ -443,9 +446,15 @@ def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_i
     params: List[str] = []
     if params_off:
         size = _u32(data, params_off)
+        if size > _MAX_PROTO_PARAMS:
+            raise ApkError("DEX prototype has too many parameters")
         for i in range(size):
             params.append(_type_descriptor(types, _u16(data, params_off + 4 + i * 2)))
-    return "(" + "".join(params) + ")" + _type_descriptor(types, return_type_idx)
+    return_type = _type_descriptor(types, return_type_idx)
+    length = 2 + sum(len(p) for p in params) + len(return_type)
+    if length > _MAX_METHOD_DESCRIPTOR:
+        raise ApkError("DEX method descriptor exceeds budget")
+    return "(" + "".join(params) + ")" + return_type
 
 
 def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int, int, str]],
@@ -459,13 +468,14 @@ def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int,
     instance_fields, p = _uleb128(data, p)
     direct_methods, p = _uleb128(data, p)
     virtual_methods, p = _uleb128(data, p)
-    if static_fields + instance_fields > 0xFFFF or direct_methods + virtual_methods > 0xFFFF:
+    if static_fields + instance_fields > 0x10000 or direct_methods + virtual_methods > 0x10000:
         raise ApkError("DEX class_data member count out of range")
     for _ in range(static_fields + instance_fields):
         _, p = _uleb128(data, p)
         _, p = _uleb128(data, p)
 
     methods: List[Dict[str, Any]] = []
+    descriptor_bytes = 0
     for count in (direct_methods, virtual_methods):
         method_idx = 0
         for _ in range(count):
@@ -476,9 +486,13 @@ def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int,
             if not 0 <= method_idx < len(method_ids):
                 raise ApkError("DEX method index out of range")
             _, proto_idx, name = method_ids[method_idx]
+            descriptor = _proto_descriptor(data, types, proto_ids_off, proto_idx)
+            descriptor_bytes += len(descriptor)
+            if descriptor_bytes > _MAX_METHOD_DESCRIPTORS:
+                raise ApkError("DEX method descriptors exceed budget")
             methods.append({
                 "name": name,
-                "descriptor": _proto_descriptor(data, types, proto_ids_off, proto_idx),
+                "descriptor": descriptor,
                 "access_flags": access_flags,
             })
     return methods
@@ -501,7 +515,7 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
     method_off = _u32(data, 92)
     class_count = _u32(data, 96)
     class_off = _u32(data, 100)
-    if type_count > 0xFFFF or method_count > 0xFFFF or class_count > 0xFFFF:
+    if type_count > 0x10000 or method_count > 0x10000 or class_count > 0x10000:
         raise ApkError("DEX index table exceeds 16-bit indices")
 
     strings = _dex_strings(data, string_off, string_count)
@@ -796,6 +810,7 @@ def _v1_certificates(blob: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
         raise ApkError("PKCS#7 has no SignerInfo")
     signer: List[Dict[str, Any]] = []
     chain: List[Dict[str, Any]] = []
+    matched_ids = set()
     for der in bag:
         try:
             issuer_serial = _x509_issuer_serial(der)
@@ -804,11 +819,14 @@ def _v1_certificates(blob: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
             continue
         entry = {"sha256": _sha256(der), "der_size": len(der)}
         if issuer_serial in signer_ids:
+            matched_ids.add(issuer_serial)
             signer.append(entry)
         else:
             chain.append(entry)
     if not signer:
         raise ApkError("no certificate matches a SignerInfo")
+    if set(signer_ids) - matched_ids:
+        raise ApkError("a SignerInfo has no matching certificate")
     return signer, chain
 
 

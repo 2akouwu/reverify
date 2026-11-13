@@ -461,6 +461,11 @@ class TestDex(unittest.TestCase):
             with self.assertRaises(ApkError):
                 parse_dex(synthetic_dex())
 
+    def test_method_descriptor_budget(self):
+        with mock.patch.object(apk_module, "_MAX_METHOD_DESCRIPTORS", 1):
+            with self.assertRaises(ApkError):
+                parse_dex(synthetic_dex())
+
 
 class TestApkInspection(unittest.TestCase):
     def test_detect_and_decode(self):

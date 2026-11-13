@@ -50,6 +50,7 @@ try:  # package import (e.g. ``from reverify import Verifier``)
     from .emulator import make_emulator, EmulatorError
     from .protocol_parser import ProtobufDissector
     from .binary import parse_binary, shannon_entropy
+    from .apk import inspect_apk
     from .behavior import behavioral_equiv, prove_expr_equiv
     from .exebench import exebench_verify, functions_equiv_verify
     from .semantic import semantic_view, INSTALL_HINT as SEMANTIC_HINT
@@ -62,6 +63,7 @@ except ImportError:  # flat import (CLI, MCP server, and the test suite)
     from _version import __version__
     from protocol_parser import ProtobufDissector
     from binary import parse_binary, shannon_entropy
+    from apk import inspect_apk
     from behavior import behavioral_equiv, prove_expr_equiv
     from exebench import exebench_verify, functions_equiv_verify
     from semantic import semantic_view, INSTALL_HINT as SEMANTIC_HINT
@@ -138,6 +140,46 @@ def _norm_ops(s: str) -> str:
     return "".join(str(s).lower().split())
 
 
+def _apk_class_name(value: Any) -> str:
+    name = str(value).strip()
+    if len(name) >= 2 and name[0] == "L" and name.endswith(";"):
+        name = name[1:-1]
+    return name.replace("/", ".")
+
+
+def _apk_resolve_name(value: Any, package: Any) -> str:
+    name = str(value).strip()
+    if package:
+        if name.startswith("."):
+            name = str(package) + name
+        elif "." not in name:
+            name = str(package) + "." + name
+    return _apk_class_name(name)
+
+
+def _apk_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ClaimError(f"'{name}' must be a boolean")
+    return value
+
+
+def _apk_scalar_match(actual: Any, expected: Any) -> bool:
+    if actual is None:
+        # An absent field cannot satisfy a claim; otherwise "None" would match
+        # a missing minSdk/targetSdk and become a false VERIFIED.
+        return False
+    if isinstance(actual, bool):
+        if isinstance(expected, bool):
+            return expected is actual
+        return str(expected).strip().lower() == ("true" if actual else "false")
+    if isinstance(actual, int):
+        try:
+            return int(str(expected), 0) == actual
+        except (TypeError, ValueError):
+            return str(expected).strip() == str(actual)
+    return str(expected) == str(actual)
+
+
 def _entropy_norm(buf: bytes) -> float:
     """Entropy of ``buf`` relative to the maximum possible for its length (0..1)."""
     n = len(buf)
@@ -185,12 +227,18 @@ class Verifier:
         "calls",
         "references",
         "reachable_from_entry",
+        # APK awareness: manifest, DEX classes/methods, signing certificates
+        "apk_manifest",
+        "apk_class_present",
+        "apk_method_present",
+        "apk_signing_certificate",
     )
 
     def __init__(self, data: bytes):
         self.data = data
         self._bin_cache = None
         self._sem_cache = None
+        self._apk_cache = None
         self._sha_cache: Optional[str] = None
 
     def receipt(self) -> Dict[str, Any]:
@@ -219,6 +267,12 @@ class Verifier:
         if self._bin_cache is None:
             self._bin_cache = parse_binary(self.data)
         return self._bin_cache
+
+    def _apk(self):
+        """Decoded APK view, cached per verifier; ``is_apk`` is False for non-APKs."""
+        if self._apk_cache is None:
+            self._apk_cache = inspect_apk(self.data)
+        return self._apk_cache
 
     # -- dispatch -----------------------------------------------------------
 
@@ -1017,6 +1071,299 @@ class Verifier:
             return VERIFIED, evidence, f"{f.name} is reachable from the entry point"
         return REFUTED, evidence, f"{f.name} is not reachable from the entry point in the call graph"
 
+    # -- APK claims ---------------------------------------------------------
+
+    def _apk_or_inconclusive(self):
+        apk = self._apk()
+        if not apk.get("is_apk"):
+            return apk, (INCONCLUSIVE, {"apk": {"is_apk": False}}, "not an APK")
+        return apk, None
+
+    def _check_apk_manifest(self, p: Dict[str, Any]):
+        """Claim: a decoded AndroidManifest.xml field has ``expected`` (or is observed)."""
+        field = p.get("field")
+        if not field:
+            raise ClaimError("apk_manifest requires 'field'")
+        apk, bad = self._apk_or_inconclusive()
+        if bad:
+            return bad
+        manifest = apk.get("manifest")
+        if manifest is None:
+            return INCONCLUSIVE, {"manifest_error": apk.get("manifest_error")}, "AndroidManifest.xml could not be decoded"
+
+        field = str(field)
+        scalar = {
+            "package": "package", "version_code": "version_code", "version_name": "version_name",
+            "min_sdk": "min_sdk", "target_sdk": "target_sdk", "compile_sdk": "compile_sdk",
+        }
+        if field in scalar:
+            actual = manifest.get(scalar[field])
+            evidence = {"field": field, "actual": actual}
+            if p.get("observe"):
+                return OBSERVED, evidence, "value read"
+            if "expected" not in p and "value" not in p:
+                raise ClaimError("apk_manifest requires 'expected' (or observe)")
+            expected = p.get("expected", p.get("value"))
+            evidence["expected"] = expected
+            ok = _apk_scalar_match(actual, expected)
+            return (VERIFIED if ok else REFUTED), evidence, (
+                f"{field} matches" if ok else f"{field} is {actual!r}, not {expected!r}"
+            )
+
+        if field in ("permission", "permissions"):
+            values = list(manifest.get("permissions") or [])
+            evidence = {"field": field, "permissions": values, "actual": values}
+            if p.get("observe"):
+                return OBSERVED, evidence, f"{len(values)} permissions read"
+            if "expected" not in p and "value" not in p:
+                raise ClaimError("apk_manifest requires 'expected' (or observe)")
+            expected = p.get("expected", p.get("value"))
+            present = _apk_bool(p.get("present", True), "present")
+            asked = {str(v) for v in expected} if isinstance(expected, (list, tuple, set)) else {str(expected)}
+            if present:
+                found = asked <= set(values)
+            else:
+                # "requests none of these": contradicted if any one is present.
+                found = bool(asked & set(values))
+            evidence.update({"expected": expected, "present": present, "found": found})
+            ok = found if present else not found
+            return (VERIFIED if ok else REFUTED), evidence, (
+                "permission claim matches" if ok else "permission claim does not match"
+            )
+
+        if field in ("activity", "activities"):
+            activities = manifest.get("activities") or []
+            names = []
+            for activity in activities:
+                for key in ("name", "resolved_name"):
+                    if activity.get(key):
+                        names.append(str(activity[key]))
+            evidence = {"field": field, "activities": names, "actual": names}
+            if p.get("observe"):
+                return OBSERVED, evidence, f"{len(names)} activity names read"
+            if "expected" not in p and "value" not in p:
+                raise ClaimError("apk_manifest requires 'expected' (or observe)")
+            expected = p.get("expected", p.get("value"))
+            present = _apk_bool(p.get("present", True), "present")
+            normalized = {_apk_class_name(name) for name in names}
+            wants = expected if isinstance(expected, (list, tuple, set)) else [expected]
+            package = manifest.get("package")
+            wanted = {_apk_resolve_name(want, package) for want in wants}
+            # A presence claim says every listed activity exists; an absence
+            # claim must be contradicted if *any* listed activity exists,
+            # otherwise [".MainActivity", ".Missing"] with present=False would
+            # be wrongly VERIFIED.
+            found = (wanted <= normalized) if present else bool(wanted & normalized)
+            evidence.update({"expected": expected, "present": present, "found": found})
+            ok = found if present else not found
+            return (VERIFIED if ok else REFUTED), evidence, (
+                "activity claim matches" if ok else "activity claim does not match"
+            )
+
+        if field in ("activity_category", "intent_filter_category"):
+            activities = manifest.get("activities") or []
+            activity_filter = p.get("activity")
+            package = manifest.get("package")
+            categories: List[str] = []
+            activity_found = False
+            for activity in activities:
+                names = {_apk_class_name(activity.get("name") or ""),
+                         _apk_class_name(activity.get("resolved_name") or "")}
+                if activity_filter and _apk_resolve_name(activity_filter, package) not in names:
+                    continue
+                activity_found = True
+                for intent_filter in activity.get("intent_filters", []):
+                    categories.extend(str(c) for c in intent_filter.get("categories") or [])
+            evidence = {"field": field, "activity": activity_filter, "categories": categories,
+                        "actual": categories}
+            if activity_filter:
+                evidence["activity_found"] = activity_found
+            if p.get("observe"):
+                return OBSERVED, evidence, f"{len(categories)} categories read"
+            if "expected" not in p and "value" not in p:
+                raise ClaimError("apk_manifest requires 'expected' (or observe)")
+            expected = p.get("expected", p.get("value"))
+            present = _apk_bool(p.get("present", True), "present")
+            asked = {str(v) for v in expected} if isinstance(expected, (list, tuple, set)) else {str(expected)}
+            if activity_filter and not activity_found:
+                # A missing activity would otherwise make an absence claim
+                # vacuously VERIFIED; refuse to certify a component that is
+                # not there at all.
+                evidence["expected"] = expected
+                evidence["present"] = present
+                evidence["found"] = False
+                return REFUTED, evidence, (
+                    f"activity {activity_filter!r} is not declared in the manifest"
+                )
+            found = (asked <= set(categories)) if present else bool(asked & set(categories))
+            evidence.update({"expected": expected, "present": present, "found": found})
+            ok = found if present else not found
+            return (VERIFIED if ok else REFUTED), evidence, (
+                "activity-category claim matches" if ok else "activity-category claim does not match"
+            )
+
+        raise ClaimError(
+            "apk_manifest field must be package/version_code/version_name/min_sdk/target_sdk/"
+            "compile_sdk/permissions/activities/activity_category"
+        )
+
+    def _apk_dexes(self, p: Dict[str, Any]):
+        apk, bad = self._apk_or_inconclusive()
+        if bad:
+            return None, None, bad
+        dexes = list(apk.get("dex") or [])
+        wanted = p.get("dex")
+        if wanted:
+            dexes = [d for d in dexes if d.get("name") == wanted]
+            if not dexes:
+                return None, None, (INCONCLUSIVE, {"dex": wanted, "available": [d.get("name") for d in apk.get("dex") or []]},
+                                    f"DEX {wanted!r} is not in this APK")
+        return dexes, apk, None
+
+    def _check_apk_class_present(self, p: Dict[str, Any]):
+        """Claim: a class name (or descriptor) is present in classes*.dex (or absent)."""
+        name = p.get("name") or p.get("class")
+        if not name:
+            raise ClaimError("apk_class_present requires 'name' or 'class'")
+        present = _apk_bool(p.get("present", True), "present")
+        dexes, apk, bad = self._apk_dexes(p)
+        if bad:
+            return bad
+        errors = [d.get("name") for d in dexes if d.get("error")]
+        classes = [c for d in dexes if not d.get("error") for c in d.get("classes") or []]
+        want = _apk_class_name(name)
+        matches = [c for c in classes
+                   if _apk_class_name(c.get("name") or "") == want
+                   or _apk_class_name(c.get("descriptor") or "") == want]
+        evidence = {
+            "class": str(name),
+            "present": present,
+            "found": bool(matches),
+            "matches": [c.get("name") for c in matches[:20]],
+            "actual": [c.get("name") for c in matches[:20]],
+        }
+        if errors:
+            evidence["dex_errors"] = errors
+        if p.get("observe"):
+            return OBSERVED, evidence, f"{len(matches)} class matches read"
+        if matches:
+            return (VERIFIED if present else REFUTED), evidence, (
+                "class is present" if present else "class is present, so the absence claim is refuted"
+            )
+        if errors:
+            return INCONCLUSIVE, evidence, "DEX parsing failed; absence is not provable from these bytes"
+        return (VERIFIED if not present else REFUTED), evidence, (
+            "class is absent" if not present else "class is not present in any classes*.dex"
+        )
+
+    def _check_apk_method_present(self, p: Dict[str, Any]):
+        """Claim: a class.method (optionally with descriptor) is present in classes*.dex (or absent)."""
+        class_name = p.get("class") or p.get("class_name")
+        method = p.get("method") or p.get("name")
+        if not class_name or not method:
+            raise ClaimError("apk_method_present requires 'class' and 'method'")
+        present = _apk_bool(p.get("present", True), "present")
+        descriptor = p.get("descriptor")
+        dexes, apk, bad = self._apk_dexes(p)
+        if bad:
+            return bad
+        errors = [d.get("name") for d in dexes if d.get("error")]
+        want_class = _apk_class_name(class_name)
+        matches: List[Dict[str, Any]] = []
+        for dex in dexes:
+            if dex.get("error"):
+                continue
+            for klass in dex.get("classes") or []:
+                if _apk_class_name(klass.get("name") or "") != want_class:
+                    continue
+                for item in klass.get("methods") or []:
+                    if str(item.get("name")) != str(method):
+                        continue
+                    if descriptor is not None and str(item.get("descriptor")) != str(descriptor):
+                        continue
+                    matches.append({
+                        "class": klass.get("name"),
+                        "method": item.get("name"),
+                        "descriptor": item.get("descriptor"),
+                    })
+        evidence = {
+            "class": str(class_name),
+            "method": str(method),
+            "descriptor": descriptor,
+            "present": present,
+            "found": bool(matches),
+            "matches": matches[:20],
+            "actual": matches[:20],
+        }
+        if errors:
+            evidence["dex_errors"] = errors
+        if p.get("observe"):
+            return OBSERVED, evidence, f"{len(matches)} method matches read"
+        if matches:
+            return (VERIFIED if present else REFUTED), evidence, (
+                "method is present" if present else "method is present, so the absence claim is refuted"
+            )
+        if errors:
+            return INCONCLUSIVE, evidence, "DEX parsing failed; absence is not provable from these bytes"
+        return (VERIFIED if not present else REFUTED), evidence, (
+            "method is absent" if not present else "method is not present in any classes*.dex"
+        )
+
+    def _check_apk_signing_certificate(self, p: Dict[str, Any]):
+        """Claim: the APK has a signer certificate with the given SHA-256 digest."""
+        digest = p.get("sha256", p.get("digest"))
+        if not digest:
+            raise ClaimError("apk_signing_certificate requires 'sha256'")
+        want = "".join(str(digest).lower().split()).replace(":", "")
+        if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
+            raise ClaimError("'sha256' must be a 64-character hex digest")
+        scheme = str(p["scheme"]).lower() if "scheme" in p else None
+        if scheme is not None and scheme not in ("v1", "v2", "v3", "v3.1"):
+            # An unknown scheme would match nothing and could verify an
+            # absence claim by typo.
+            raise ClaimError("'scheme' must be v1, v2, v3 or v3.1")
+        present = _apk_bool(p.get("present", True), "present")
+        apk, bad = self._apk_or_inconclusive()
+        if bad:
+            return bad
+        signing = apk.get("signing") or {}
+        certs = signing.get("certificates") or []
+        matches = [
+            c for c in certs
+            if str(c.get("sha256", "")).lower() == want
+            and (scheme is None or scheme in (c.get("schemes") or []))
+        ]
+        errors: List[str] = []
+        if signing.get("error"):
+            errors.append(str(signing["error"]))
+        for name in ("v1", "v2", "v3", "v3.1"):
+            errors.extend(str(e) for e in (signing.get(name, {}).get("errors") or []))
+        evidence = {
+            "sha256": want,
+            "scheme": scheme,
+            "present": present,
+            "found": bool(matches),
+            "schemes": signing.get("schemes") or [],
+            "certificates": [{"sha256": c.get("sha256"), "schemes": c.get("schemes") or []}
+                             for c in certs],
+            "chain_certificates": [{"sha256": c.get("sha256"), "schemes": c.get("schemes") or []}
+                                   for c in signing.get("chain_certificates", [])],
+        }
+        evidence["actual"] = evidence["certificates"]
+        if errors:
+            evidence["signing_errors"] = errors
+        if p.get("observe"):
+            return OBSERVED, evidence, f"{len(certs)} signer certificates read"
+        if matches:
+            return (VERIFIED if present else REFUTED), evidence, (
+                "certificate digest is present" if present else "certificate digest is present, so the absence claim is refuted"
+            )
+        if errors:
+            return INCONCLUSIVE, evidence, "signing data could not be fully parsed; absence is not provable"
+        return (VERIFIED if not present else REFUTED), evidence, (
+            "certificate digest is absent" if not present else "no signer certificate has this SHA-256"
+        )
+
     # -- helpers ------------------------------------------------------------
 
     def _result(self, claim: Claim, verdict: str, evidence: Dict[str, Any], detail: str) -> Dict[str, Any]:
@@ -1178,6 +1525,11 @@ def base_weight(result: Dict[str, Any]) -> float:
         return 0.3
     if kind == "section_present":
         return 0.3 if "virtual_address" in p else 0.2
+    # APK structural kinds: fixed tier until corpus base rates exist.
+    if kind in ("apk_manifest", "apk_class_present", "apk_method_present"):
+        return 0.3
+    if kind == "apk_signing_certificate":
+        return 0.5
     return 0.3
 
 

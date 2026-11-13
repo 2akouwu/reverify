@@ -1,5 +1,8 @@
+import argparse
+import contextlib
 import hashlib
 import io
+import json
 import struct
 import sys
 import unittest
@@ -19,7 +22,7 @@ from apk import (  # noqa: E402
     is_apk,
     parse_dex,
 )
-from cli import auto_triage  # noqa: E402
+from cli import auto_triage, cmd_auto, cmd_parse_apk  # noqa: E402
 from verifier import (  # noqa: E402
     Claim,
     INCONCLUSIVE,
@@ -411,6 +414,38 @@ class TestApkInspection(unittest.TestCase):
         report = inspect_apk(b"not a zip")
         self.assertFalse(report["is_apk"])
         self.assertIn("error", report)
+
+
+class TestApkCli(unittest.TestCase):
+    def test_parse_apk_json(self):
+        args = argparse.Namespace(file=synthetic_apk(v2=True).hex(), json=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_parse_apk(args)
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["is_apk"])
+        self.assertEqual(report["manifest"]["package"], "com.example.tv")
+        self.assertEqual(report["signing"]["schemes"], ["v2"])
+
+    def test_auto_human_output(self):
+        args = argparse.Namespace(target=synthetic_apk(v2=True).hex(), json=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_auto(args)
+        text = out.getvalue()
+        self.assertIn("Detected Type: Android APK", text)
+        self.assertIn("Package:      com.example.tv", text)
+        self.assertIn("cert SHA-256", text)
+
+    def test_parse_apk_rejects_non_apk(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("readme.txt", "hello")
+        args = argparse.Namespace(file=buffer.getvalue().hex(), json=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_parse_apk(args)
+        self.assertIn("Not an APK", out.getvalue())
 
 
 class TestApkClaims(unittest.TestCase):

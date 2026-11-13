@@ -276,9 +276,17 @@ def _print_apk_report(report: Dict[str, Any]) -> None:
             print(f"DEX:          {dex.get('name')}: {dex.get('class_count')} classes, {dex.get('method_count')} methods")
     signing = report.get("signing") or {}
     schemes = signing.get("schemes") or []
-    print(f"Signing:      {', '.join(schemes) if schemes else 'none'}")
+    if signing.get("error"):
+        print(f"Signing:      unavailable: {signing['error']}")
+    else:
+        print(f"Signing:      {', '.join(schemes) if schemes else 'none'}")
     for cert in signing.get("certificates", []):
         print(f"  cert SHA-256: {cert['sha256']} ({', '.join(cert.get('schemes', []))})")
+    for cert in signing.get("chain_certificates", []):
+        print(f"  chain SHA-256: {cert['sha256']} ({', '.join(cert.get('schemes', []))})")
+    for scheme in ("v1", "v2", "v3", "v3.1"):
+        for error in (signing.get(scheme) or {}).get("errors", []):
+            print(f"  signing note ({scheme}): {error}")
     if report.get("manifest_error"):
         print(f"Manifest note: {report['manifest_error']}")
     if report.get("error"):

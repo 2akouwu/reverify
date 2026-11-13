@@ -25,6 +25,7 @@ APK_SIG_BLOCK_MAGIC = b"APK Sig Block 42"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_DEX_BYTES = 256 * 1024 * 1024
 _MAX_SIGNATURE_BYTES = 64 * 1024 * 1024
+_MAX_DECODED_STRINGS = 64 * 1024 * 1024
 
 # Chunk types from frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h
 _RES_STRING_POOL_TYPE = 0x0001
@@ -112,20 +113,30 @@ def _parse_string_pool(data: bytes, off: int = 0) -> List[str]:
         raise ApkError("string pool offsets out of range")
 
     strings: List[str] = []
+    decoded_bytes = 0
     for i in range(count):
         rel = _u32(data, offsets_at + i * 4)
         p = strings_at + rel
         if p >= end:
-            strings.append("")
-            continue
+            raise ApkError("string pool entry points past the chunk")
         if utf8:
             _, p = _decode_len8(data, p)  # UTF-16 length, unused
             byte_len, p = _decode_len8(data, p)
-            raw = data[p : min(p + byte_len, end)]
+            if p + byte_len > end:
+                raise ApkError("string pool entry runs past the chunk")
+            raw = data[p : p + byte_len]
+            decoded_bytes += byte_len
+            if decoded_bytes > _MAX_DECODED_STRINGS:
+                raise ApkError("decoded string pool exceeds budget")
             strings.append(raw.decode("utf-8", errors="replace"))
         else:
             char_len, p = _decode_len16(data, p)
-            raw = data[p : min(p + char_len * 2, end)]
+            if p + char_len * 2 > end:
+                raise ApkError("string pool entry runs past the chunk")
+            raw = data[p : p + char_len * 2]
+            decoded_bytes += len(raw)
+            if decoded_bytes > _MAX_DECODED_STRINGS:
+                raise ApkError("decoded string pool exceeds budget")
             strings.append(raw.decode("utf-16le", errors="replace"))
     return strings
 
@@ -175,7 +186,9 @@ def _parse_axml(data: bytes) -> Tuple[List[str], List[_Element]]:
     if len(data) < 8 or _u16(data, 0) != _RES_XML_TYPE:
         raise ApkError("not a binary XML document")
     total = _u32(data, 4)
-    end = min(total, len(data)) if total else len(data)
+    if total < 8 or total > len(data):
+        raise ApkError("truncated binary XML document")
+    end = total
     off = 8
     strings: List[str] = []
     roots: List[_Element] = []
@@ -186,7 +199,7 @@ def _parse_axml(data: bytes) -> Tuple[List[str], List[_Element]]:
         header_size = _u16(data, off + 2)
         chunk_size = _u32(data, off + 4)
         if chunk_size < 8 or off + chunk_size > end:
-            break
+            raise ApkError("truncated AXML chunk")
         chunk = data[off : off + chunk_size]
 
         if chunk_type == _RES_STRING_POOL_TYPE:
@@ -225,24 +238,38 @@ def _parse_axml(data: bytes) -> Tuple[List[str], List[_Element]]:
                 roots.append(element)
             stack.append(element)
         elif chunk_type == _RES_XML_END_ELEMENT_TYPE:
-            if stack:
-                stack.pop()
+            if not stack:
+                raise ApkError("unexpected XML end element")
+            stack.pop()
 
         off += chunk_size
 
+    if off < end and any(data[off:end]):
+        raise ApkError("trailing bytes after the last AXML chunk")
+    if stack:
+        raise ApkError("unclosed XML element")
     return strings, roots
 
 
-def _attr(element: _Element, name: str) -> Optional[_Attr]:
+def _attr(element: _Element, name: str, namespace: Optional[str] = ANDROID_NS) -> Optional[_Attr]:
     for attribute in element.attributes:
-        if attribute.name == name:
+        if attribute.name == name and attribute.namespace == namespace:
             return attribute
     return None
 
 
-def _attr_value(element: _Element, name: str, default: Any = None) -> Any:
-    attribute = _attr(element, name)
+def _attr_value(element: _Element, name: str, default: Any = None,
+                namespace: Optional[str] = ANDROID_NS) -> Any:
+    attribute = _attr(element, name, namespace=namespace)
     return default if attribute is None else attribute.value
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
 
 
 def _children(element: _Element, name: str) -> List[_Element]:
@@ -270,7 +297,7 @@ def _manifest_summary(roots: List[_Element]) -> Dict[str, Any]:
         # caller mistake an arbitrary AXML for an APK manifest.
         raise ApkError("root element is %r, not 'manifest'" % manifest.name)
 
-    package = _attr_value(manifest, "package")
+    package = _attr_value(manifest, "package", namespace=None)
     if package is not None:
         package = str(package)
     version_code = _attr_value(manifest, "versionCode")
@@ -310,7 +337,7 @@ def _manifest_summary(roots: List[_Element]) -> Dict[str, Any]:
                 for item in _children(intent_filter, "data"):
                     attributes = {}
                     for a in item.attributes:
-                        if a.value is not None:
+                        if a.value is not None and a.namespace in (ANDROID_NS, None):
                             attributes[a.name] = a.value
                     if attributes:
                         data.append(attributes)
@@ -323,7 +350,7 @@ def _manifest_summary(roots: List[_Element]) -> Dict[str, Any]:
                 "intent_filters": filters,
             }
             if exported is not None:
-                entry["exported"] = bool(exported)
+                entry["exported"] = _bool_value(exported)
             activities.append(entry)
 
     return {
@@ -341,6 +368,8 @@ def _manifest_summary(roots: List[_Element]) -> Dict[str, Any]:
 def decode_axml(data: bytes) -> Dict[str, Any]:
     """Decode the binary ``AndroidManifest.xml`` payload (AXML) of an APK."""
     _, roots = _parse_axml(data)
+    if len(roots) != 1:
+        raise ApkError("binary XML has %d root elements, not 1" % len(roots))
     return _manifest_summary(roots)
 
 
@@ -364,23 +393,33 @@ def _uleb128(data: bytes, off: int) -> Tuple[int, int]:
 
 
 def _mutf8(raw: bytes) -> str:
-    # MUTF-8 encodes U+0000 as C0 80 and surrogate pairs as two 3-byte
-    # sequences.  Ordinary names are plain UTF-8; a replacement fallback keeps
-    # a hostile DEX from raising.
-    return raw.replace(b"\xc0\x80", b"\x00").decode("utf-8", errors="replace")
+    # MUTF-8 encodes U+0000 as C0 80 and supplementary characters as a pair of
+    # 3-byte surrogate sequences.  ``surrogatepass`` keeps those sequences
+    # intact during the UTF-8 pass; a UTF-16 round-trip then combines them.
+    raw = raw.replace(b"\xc0\x80", b"\x00")
+    try:
+        text = raw.decode("utf-8", errors="surrogatepass")
+        if any("\ud800" <= ch <= "\udfff" for ch in text):
+            text = text.encode("utf-16", errors="surrogatepass").decode("utf-16")
+        return text
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return raw.decode("utf-8", errors="replace")
 
 
 def _dex_strings(data: bytes, string_ids_off: int, count: int) -> List[str]:
     strings: List[str] = []
+    decoded_bytes = 0
     for i in range(count):
         string_off = _u32(data, string_ids_off + i * 4)
         if string_off >= len(data):
-            strings.append("")
-            continue
+            raise ApkError("DEX string offset out of range")
         _, p = _uleb128(data, string_off)
         end = data.find(b"\x00", p)
         if end < 0:
-            end = len(data)
+            raise ApkError("unterminated DEX string")
+        decoded_bytes += end - p
+        if decoded_bytes > _MAX_DECODED_STRINGS:
+            raise ApkError("decoded DEX strings exceed budget")
         strings.append(_mutf8(data[p:end]))
     return strings
 
@@ -394,33 +433,34 @@ def _descriptor_to_name(descriptor: str) -> str:
 def _type_descriptor(types: List[str], type_idx: int) -> str:
     if 0 <= type_idx < len(types):
         return types[type_idx]
-    return ""
+    raise ApkError("DEX type index out of range")
 
 
 def _proto_descriptor(data: bytes, types: List[str], proto_ids_off: int, proto_idx: int) -> str:
-    try:
-        base = proto_ids_off + proto_idx * 12
-        return_type_idx = _u32(data, base + 4)
-        params_off = _u32(data, base + 8)
-        params: List[str] = []
-        if params_off:
-            size = _u32(data, params_off)
-            for i in range(size):
-                params.append(_type_descriptor(types, _u16(data, params_off + 4 + i * 2)))
-        return "(" + "".join(params) + ")" + _type_descriptor(types, return_type_idx)
-    except ApkError:
-        return ""
+    base = proto_ids_off + proto_idx * 12
+    return_type_idx = _u32(data, base + 4)
+    params_off = _u32(data, base + 8)
+    params: List[str] = []
+    if params_off:
+        size = _u32(data, params_off)
+        for i in range(size):
+            params.append(_type_descriptor(types, _u16(data, params_off + 4 + i * 2)))
+    return "(" + "".join(params) + ")" + _type_descriptor(types, return_type_idx)
 
 
 def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int, int, str]],
                    types: List[str], proto_ids_off: int) -> List[Dict[str, Any]]:
-    if not class_data_off or class_data_off >= len(data):
-        return []
+    if class_data_off == 0:
+        return []  # the valid "class has no data" encoding
+    if class_data_off >= len(data):
+        raise ApkError("DEX class_data offset out of range")
     p = class_data_off
     static_fields, p = _uleb128(data, p)
     instance_fields, p = _uleb128(data, p)
     direct_methods, p = _uleb128(data, p)
     virtual_methods, p = _uleb128(data, p)
+    if static_fields + instance_fields > 0xFFFF or direct_methods + virtual_methods > 0xFFFF:
+        raise ApkError("DEX class_data member count out of range")
     for _ in range(static_fields + instance_fields):
         _, p = _uleb128(data, p)
         _, p = _uleb128(data, p)
@@ -433,13 +473,14 @@ def _class_methods(data: bytes, class_data_off: int, method_ids: List[Tuple[int,
             method_idx += diff
             access_flags, p = _uleb128(data, p)
             _, p = _uleb128(data, p)  # code_off
-            if 0 <= method_idx < len(method_ids):
-                class_idx, proto_idx, name = method_ids[method_idx]
-                methods.append({
-                    "name": name,
-                    "descriptor": _proto_descriptor(data, types, proto_ids_off, proto_idx),
-                    "access_flags": access_flags,
-                })
+            if not 0 <= method_idx < len(method_ids):
+                raise ApkError("DEX method index out of range")
+            _, proto_idx, name = method_ids[method_idx]
+            methods.append({
+                "name": name,
+                "descriptor": _proto_descriptor(data, types, proto_ids_off, proto_idx),
+                "access_flags": access_flags,
+            })
     return methods
 
 
@@ -460,12 +501,16 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
     method_off = _u32(data, 92)
     class_count = _u32(data, 96)
     class_off = _u32(data, 100)
+    if type_count > 0xFFFF or method_count > 0xFFFF or class_count > 0xFFFF:
+        raise ApkError("DEX index table exceeds 16-bit indices")
 
     strings = _dex_strings(data, string_off, string_count)
     types = []
     for i in range(type_count):
         descriptor_idx = _u32(data, type_off + i * 4)
-        types.append(strings[descriptor_idx] if 0 <= descriptor_idx < len(strings) else "")
+        if descriptor_idx >= len(strings):
+            raise ApkError("DEX type descriptor index out of range")
+        types.append(strings[descriptor_idx])
 
     method_ids: List[Tuple[int, int, str]] = []
     for i in range(method_count):
@@ -473,7 +518,9 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
         class_idx = _u16(data, base)
         proto_idx = _u16(data, base + 2)
         name_idx = _u32(data, base + 4)
-        method_ids.append((class_idx, proto_idx, strings[name_idx] if 0 <= name_idx < len(strings) else ""))
+        if name_idx >= len(strings):
+            raise ApkError("DEX method name index out of range")
+        method_ids.append((class_idx, proto_idx, strings[name_idx]))
 
     classes: List[Dict[str, Any]] = []
     total_methods = 0
@@ -486,12 +533,14 @@ def parse_dex(data: bytes, name: str = "classes.dex") -> Dict[str, Any]:
         descriptor = _type_descriptor(types, class_idx)
         methods = _class_methods(data, class_data_off, method_ids, types, proto_off)
         total_methods += len(methods)
+        superclass = None
+        if superclass_idx != 0xFFFFFFFF:
+            superclass = _descriptor_to_name(_type_descriptor(types, superclass_idx))
         classes.append({
             "name": _descriptor_to_name(descriptor),
             "descriptor": descriptor,
             "access_flags": access_flags,
-            "superclass": _descriptor_to_name(_type_descriptor(types, superclass_idx))
-            if superclass_idx != 0xFFFFFFFF else None,
+            "superclass": superclass,
             "methods": methods,
         })
 
@@ -534,8 +583,24 @@ def _parse_certs(blob: bytes) -> List[Dict[str, Any]]:
     while off < len(blob):
         cert, off = _read_lp(blob, off)
         if cert:
-            certs.append({"sha256": _sha256(cert), "der_size": len(cert)})
+            certs.append({"sha256": _sha256(cert), "der_size": len(cert), "der": cert})
     return certs
+
+
+def _public_cert(cert: Dict[str, Any]) -> Dict[str, Any]:
+    return {"sha256": cert["sha256"], "der_size": cert["der_size"]}
+
+
+def _signer_certs(blob: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return (signer certificates, chain certificates) for one signer.
+
+    APK Signature Scheme v2/v3 list the signer's certificate first; the rest
+    are its chain.  Only the first is the identity a claim should match.
+    """
+    certs = _parse_certs(blob)
+    if not certs:
+        return [], []
+    return [_public_cert(certs[0])], [_public_cert(c) for c in certs[1:]]
 
 
 def _parse_signer_v2(signer: bytes) -> Dict[str, Any]:
@@ -544,8 +609,10 @@ def _parse_signer_v2(signer: bytes) -> Dict[str, Any]:
     public_key, off = _read_lp(signer, off)
     _, p = _read_lp(signed_data, 0)  # digests
     certs_blob, p = _read_lp(signed_data, p)
+    signer_certs, chain_certs = _signer_certs(certs_blob)
     return {
-        "certificates": _parse_certs(certs_blob),
+        "certificates": signer_certs,
+        "chain_certificates": chain_certs,
         "public_key_sha256": _sha256(public_key) if public_key else None,
     }
 
@@ -554,7 +621,11 @@ def _parse_signer_v3(signer: bytes) -> Dict[str, Any]:
     signed_data, off = _read_lp(signer, 0)
     _, p = _read_lp(signed_data, 0)  # digests
     certs_blob, p = _read_lp(signed_data, p)
-    result: Dict[str, Any] = {"certificates": _parse_certs(certs_blob)}
+    signer_certs, chain_certs = _signer_certs(certs_blob)
+    result: Dict[str, Any] = {
+        "certificates": signer_certs,
+        "chain_certificates": chain_certs,
+    }
     try:
         result["min_sdk"] = _u32(signer, off)
         result["max_sdk"] = _u32(signer, off + 4)
@@ -588,21 +659,23 @@ def _apk_signing_pairs(data: bytes) -> Dict[int, List[bytes]]:
     if central_dir_off < 24 or central_dir_off > len(data):
         return {}
     if data[central_dir_off - 16 : central_dir_off] != APK_SIG_BLOCK_MAGIC:
-        return {}
+        return {}  # no signing block at all
     size = _u64(data, central_dir_off - 24)
     if size < 24 or size > central_dir_off - 8:
-        return {}
+        raise ApkError("malformed APK signing block size")
     block_start = central_dir_off - 8 - size
     if block_start < 0 or _u64(data, block_start) != size:
-        return {}
+        raise ApkError("APK signing block size fields disagree")
     pairs: Dict[int, List[bytes]] = {}
     p = block_start + 8
     end = central_dir_off - 24
-    while p + 12 <= end:
+    while p < end:
+        if p + 12 > end:
+            raise ApkError("truncated APK signing block pair header")
         pair_len = _u64(data, p)
         p += 8
         if pair_len < 4 or p + pair_len > end:
-            break
+            raise ApkError("malformed APK signing block pair length")
         pair_id = _u32(data, p)
         value = data[p + 4 : p + pair_len]
         p += pair_len
@@ -629,7 +702,62 @@ def _der_tlv(buf: bytes, off: int) -> Tuple[int, bytes, int, int]:
     return tag, buf[off : off + length], off + length, start
 
 
-def _pkcs7_certificates(blob: bytes) -> List[Dict[str, Any]]:
+def _x509_issuer_serial(der: bytes) -> Tuple[bytes, bytes]:
+    """Return ``(issuer Name DER, serialNumber INTEGER content)`` for a certificate."""
+    tag, cert_content, _, _ = _der_tlv(der, 0)
+    if tag != 0x30:
+        raise ApkError("certificate is not a sequence")
+    tag, tbs, _, _ = _der_tlv(cert_content, 0)
+    if tag != 0x30:
+        raise ApkError("tbsCertificate is not a sequence")
+
+    p = 0
+    tag, value, next_off, _ = _der_tlv(tbs, p)
+    if tag == 0xA0:  # optional [0] EXPLICIT version
+        p = next_off
+        tag, value, next_off, _ = _der_tlv(tbs, p)
+    if tag != 0x02:
+        raise ApkError("serialNumber is not an INTEGER")
+    serial = value
+    p = next_off
+    tag, _, next_off, _ = _der_tlv(tbs, p)  # signatureAlgorithm
+    if tag != 0x30:
+        raise ApkError("signatureAlgorithm is not a sequence")
+    p = next_off
+    tag, _, next_off, issuer_start = _der_tlv(tbs, p)  # issuer Name
+    if tag != 0x30:
+        raise ApkError("issuer is not a sequence")
+    return tbs[issuer_start:next_off], serial
+
+
+def _signer_ids(signer_infos: bytes) -> List[Tuple[bytes, bytes]]:
+    """Return the IssuerAndSerialNumber identifiers of PKCS#7 SignerInfos."""
+    ids: List[Tuple[bytes, bytes]] = []
+    p = 0
+    while p < len(signer_infos):
+        tag, signer_info, p, _ = _der_tlv(signer_infos, p)
+        if tag != 0x30:
+            continue
+        q = 0
+        tag, _, q, _ = _der_tlv(signer_info, q)  # version
+        if tag != 0x02:
+            continue
+        tag, sid, q, _ = _der_tlv(signer_info, q)
+        if tag != 0x30:  # subjectKeyIdentifier form: cannot map without extensions
+            continue
+        r = 0
+        tag, _, r, issuer_start = _der_tlv(sid, r)
+        if tag != 0x30:
+            continue
+        issuer = sid[issuer_start:r]
+        tag, serial, r, _ = _der_tlv(sid, r)
+        if tag != 0x02:
+            continue
+        ids.append((issuer, serial))
+    return ids
+
+
+def _pkcs7_parts(blob: bytes) -> Tuple[List[bytes], List[Tuple[bytes, bytes]]]:
     tag, content, _, _ = _der_tlv(blob, 0)
     if tag != 0x30:
         raise ApkError("PKCS#7 ContentInfo is not a sequence")
@@ -641,21 +769,47 @@ def _pkcs7_certificates(blob: bytes) -> List[Dict[str, Any]]:
     if tag != 0x30:
         raise ApkError("PKCS#7 SignedData is not a sequence")
 
-    certs: List[Dict[str, Any]] = []
+    bag: List[bytes] = []
+    sets: List[bytes] = []
     off = 0
     while off < len(signed_data):
         tag, value, next_off, _ = _der_tlv(signed_data, off)
         off = next_off
-        if tag != 0xA0:  # [0] IMPLICIT CertificateSet
+        if tag == 0xA0:  # [0] IMPLICIT CertificateSet
+            c_off = 0
+            while c_off < len(value):
+                c_tag, _, c_next, c_start = _der_tlv(value, c_off)
+                if c_tag == 0x30:
+                    bag.append(value[c_start:c_next])
+                c_off = c_next
+        elif tag == 0x31:  # SET: digestAlgorithms, then signerInfos last
+            sets.append(value)
+    signer_ids = _signer_ids(sets[-1]) if sets else []
+    return bag, signer_ids
+
+
+def _v1_certificates(blob: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    bag, signer_ids = _pkcs7_parts(blob)
+    if not bag:
+        raise ApkError("PKCS#7 has no certificates")
+    if not signer_ids:
+        raise ApkError("PKCS#7 has no SignerInfo")
+    signer: List[Dict[str, Any]] = []
+    chain: List[Dict[str, Any]] = []
+    for der in bag:
+        try:
+            issuer_serial = _x509_issuer_serial(der)
+        except ApkError:
+            chain.append({"sha256": _sha256(der), "der_size": len(der)})
             continue
-        c_off = 0
-        while c_off < len(value):
-            c_tag, _, c_next, c_start = _der_tlv(value, c_off)
-            if c_tag == 0x30:
-                der = value[c_start:c_next]
-                certs.append({"sha256": _sha256(der), "der_size": len(der)})
-            c_off = c_next
-    return certs
+        entry = {"sha256": _sha256(der), "der_size": len(der)}
+        if issuer_serial in signer_ids:
+            signer.append(entry)
+        else:
+            chain.append(entry)
+    if not signer:
+        raise ApkError("no certificate matches a SignerInfo")
+    return signer, chain
 
 
 def _v1_report(zf: zipfile.ZipFile, names: List[str]) -> Dict[str, Any]:
@@ -666,11 +820,14 @@ def _v1_report(zf: zipfile.ZipFile, names: List[str]) -> Dict[str, Any]:
     )
     present = bool(sf_files and block_files)
     certs: List[Dict[str, Any]] = []
+    chain: List[Dict[str, Any]] = []
     errors: List[str] = []
     if present:
         for name in block_files:
             try:
-                certs.extend(_pkcs7_certificates(_read_entry(zf, name, _MAX_SIGNATURE_BYTES)))
+                signer, extra = _v1_certificates(_read_entry(zf, name, _MAX_SIGNATURE_BYTES))
+                certs.extend(signer)
+                chain.extend(extra)
             except Exception as exc:
                 errors.append("%s: %s" % (name, exc))
     return {
@@ -679,6 +836,7 @@ def _v1_report(zf: zipfile.ZipFile, names: List[str]) -> Dict[str, Any]:
         "manifest_files": sf_files,
         "signature_files": block_files,
         "certificates": certs,
+        "chain_certificates": chain,
         **({"errors": errors} if errors else {}),
     }
 
@@ -708,18 +866,27 @@ def signing_report(data: bytes, zf: zipfile.ZipFile, names: List[str]) -> Dict[s
     schemes = [name for name, entry in entries.items() if entry["present"]]
 
     cert_sources: Dict[str, set] = {}
+    chain_sources: Dict[str, set] = {}
     for scheme, entry in entries.items():
         for signer in entry.get("signers", []):
             for cert in signer.get("certificates", []):
                 cert_sources.setdefault(cert["sha256"], set()).add(scheme)
+            for cert in signer.get("chain_certificates", []):
+                chain_sources.setdefault(cert["sha256"], set()).add(scheme)
         for cert in entry.get("certificates", []):
             cert_sources.setdefault(cert["sha256"], set()).add(scheme)
+        for cert in entry.get("chain_certificates", []):
+            chain_sources.setdefault(cert["sha256"], set()).add(scheme)
 
     return {
         "schemes": schemes,
         "certificates": [
             {"sha256": digest, "schemes": sorted(sources)}
             for digest, sources in sorted(cert_sources.items())
+        ],
+        "chain_certificates": [
+            {"sha256": digest, "schemes": sorted(sources)}
+            for digest, sources in sorted(chain_sources.items())
         ],
         "v1": v1,
         "v2": v2,
@@ -735,7 +902,17 @@ def _dex_sort_key(name: str) -> Optional[int]:
     match = re.fullmatch(r"classes(\d*)\.dex", name)
     if not match:
         return None
-    return int(match.group(1)) if match.group(1) else 1
+    digits = match.group(1)
+    if not digits:
+        return 1
+    # Converted digit strings above the interpreter's int-conversion limit
+    # raise ValueError; an absurd name is not a DEX we should try to read.
+    if len(digits) > 9:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 
 def _dex_names(names: List[str]) -> List[str]:

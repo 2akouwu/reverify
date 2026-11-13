@@ -147,6 +147,16 @@ def _apk_class_name(value: Any) -> str:
     return name.replace("/", ".")
 
 
+def _apk_resolve_name(value: Any, package: Any) -> str:
+    name = str(value).strip()
+    if package:
+        if name.startswith("."):
+            name = str(package) + name
+        elif "." not in name:
+            name = str(package) + "." + name
+    return _apk_class_name(name)
+
+
 def _apk_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ClaimError(f"'{name}' must be a boolean")
@@ -1131,7 +1141,8 @@ class Verifier:
             present = _apk_bool(p.get("present", True), "present")
             normalized = {_apk_class_name(name) for name in names}
             wants = expected if isinstance(expected, (list, tuple, set)) else [expected]
-            wanted = {_apk_class_name(want) for want in wants}
+            package = manifest.get("package")
+            wanted = {_apk_resolve_name(want, package) for want in wants}
             # A presence claim says every listed activity exists; an absence
             # claim must be contradicted if *any* listed activity exists,
             # otherwise [".MainActivity", ".Missing"] with present=False would
@@ -1146,11 +1157,12 @@ class Verifier:
         if field in ("activity_category", "intent_filter_category"):
             activities = manifest.get("activities") or []
             activity_filter = p.get("activity")
+            package = manifest.get("package")
             categories: List[str] = []
             for activity in activities:
                 names = {_apk_class_name(activity.get("name") or ""),
                          _apk_class_name(activity.get("resolved_name") or "")}
-                if activity_filter and _apk_class_name(activity_filter) not in names:
+                if activity_filter and _apk_resolve_name(activity_filter, package) not in names:
                     continue
                 for intent_filter in activity.get("intent_filters", []):
                     categories.extend(str(c) for c in intent_filter.get("categories") or [])
@@ -1307,6 +1319,8 @@ class Verifier:
             "schemes": signing.get("schemes") or [],
             "certificates": [{"sha256": c.get("sha256"), "schemes": c.get("schemes") or []}
                              for c in certs],
+            "chain_certificates": [{"sha256": c.get("sha256"), "schemes": c.get("schemes") or []}
+                                   for c in signing.get("chain_certificates", [])],
         }
         if errors:
             evidence["signing_errors"] = errors

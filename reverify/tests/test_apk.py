@@ -6,6 +6,7 @@ import json
 import struct
 import sys
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -17,11 +18,14 @@ from apk import (  # noqa: E402
     ANDROID_NS,
     APK_SIG_BLOCK_MAGIC,
     ApkError,
+    _bool_value,
+    _mutf8,
     decode_axml,
     inspect_apk,
     is_apk,
     parse_dex,
 )
+import apk as apk_module  # noqa: E402
 from cli import auto_triage, cmd_auto, cmd_parse_apk  # noqa: E402
 from verifier import (  # noqa: E402
     Claim,
@@ -142,24 +146,38 @@ class _AxmlBuilder:
         return struct.pack("<HHI", 0x0003, 8, 8 + len(pool) + len(chunks)) + pool + bytes(chunks)
 
 
-def synthetic_manifest_axml() -> bytes:
+CUSTOM_NS = "http://example.com/custom"
+
+
+def synthetic_manifest_axml(activity_name: str = ".MainActivity", custom_collision: bool = False) -> bytes:
     builder = _AxmlBuilder()
+    if custom_collision:
+        builder.start_ns("custom", CUSTOM_NS)
     builder.start_ns("android", ANDROID_NS)
-    builder.start("manifest", [
+    manifest_attrs = [
         (None, "package", "com.example.tv"),
         (ANDROID_NS, "versionCode", 42),
         (ANDROID_NS, "versionName", "1.2.3"),
         (ANDROID_NS, "compileSdkVersion", 33),
-    ])
+    ]
+    if custom_collision:
+        manifest_attrs.insert(0, (CUSTOM_NS, "package", "com.evil.package"))
+    builder.start("manifest", manifest_attrs)
     builder.start("uses-sdk", [
         (ANDROID_NS, "minSdkVersion", 21),
         (ANDROID_NS, "targetSdkVersion", 30),
     ])
     builder.end("uses-sdk")
-    builder.start("uses-permission", [(ANDROID_NS, "name", "android.permission.INTERNET")])
+    permission_attrs = [(ANDROID_NS, "name", "android.permission.INTERNET")]
+    if custom_collision:
+        permission_attrs.insert(0, (CUSTOM_NS, "name", "custom.permission.FAKE"))
+    builder.start("uses-permission", permission_attrs)
     builder.end("uses-permission")
     builder.start("application")
-    builder.start("activity", [(ANDROID_NS, "name", ".MainActivity")])
+    activity_attrs = [(ANDROID_NS, "name", activity_name)]
+    if custom_collision:
+        activity_attrs.insert(0, (CUSTOM_NS, "name", ".FakeActivity"))
+    builder.start("activity", activity_attrs)
     builder.start("intent-filter")
     builder.start("action", [(ANDROID_NS, "name", "android.intent.action.MAIN")])
     builder.end("action")
@@ -172,6 +190,8 @@ def synthetic_manifest_axml() -> bytes:
     builder.end("application")
     builder.end("manifest")
     builder.end_ns("android", ANDROID_NS)
+    if custom_collision:
+        builder.end_ns("custom", CUSTOM_NS)
     return builder.build()
 
 
@@ -250,6 +270,15 @@ def _find_eocd(data: bytes):
     return None
 
 
+def _corrupt_signing_size(apk: bytes) -> bytes:
+    eocd = _find_eocd(apk)
+    central_dir = struct.unpack_from("<I", apk, eocd + 16)[0]
+    size = struct.unpack_from("<Q", apk, central_dir - 24)[0]
+    bad = bytearray(apk)
+    struct.pack_into("<Q", bad, central_dir - 24, size + 1)
+    return bytes(bad)
+
+
 def _add_signing_block(apk: bytes, pairs) -> bytes:
     eocd = _find_eocd(apk)
     central_dir = struct.unpack_from("<I", apk, eocd + 16)[0]
@@ -264,14 +293,16 @@ def _add_signing_block(apk: bytes, pairs) -> bytes:
     return bytes(out)
 
 
-def _v2_value(cert: bytes) -> bytes:
-    signed_data = _lp(b"") + _lp(_lp(cert)) + _lp(b"")
+def _v2_value(cert: bytes, chain=()) -> bytes:
+    certs = b"".join(_lp(c) for c in (cert,) + tuple(chain))
+    signed_data = _lp(b"") + _lp(certs) + _lp(b"")
     signer = _lp(signed_data) + _lp(b"") + _lp(b"public-key")
     return _lp(_lp(signer))
 
 
-def _v3_value(cert: bytes) -> bytes:
-    signed_data = _lp(b"") + _lp(_lp(cert)) + struct.pack("<II", 21, 30) + _lp(b"")
+def _v3_value(cert: bytes, chain=()) -> bytes:
+    certs = b"".join(_lp(c) for c in (cert,) + tuple(chain))
+    signed_data = _lp(b"") + _lp(certs) + struct.pack("<II", 21, 30) + _lp(b"")
     signer = _lp(signed_data) + struct.pack("<II", 21, 30) + _lp(b"") + _lp(b"public-key")
     return _lp(_lp(signer))
 
@@ -286,7 +317,36 @@ def _der(tag: int, content: bytes) -> bytes:
     return bytes([tag]) + encoded + content
 
 
-def _pkcs7(cert: bytes) -> bytes:
+def _issuer_der() -> bytes:
+    return _der(0x30, _der(0x31, _der(0x30, _der(0x06, bytes.fromhex("2A864886F70D010101"))
+                                      + _der(0x0C, b"Test"))))
+
+
+CERT_SERIAL = b"\x2a"
+
+
+def cert_der(serial: bytes = CERT_SERIAL) -> bytes:
+    tbs = _der(0x30, b"".join([
+        _der(0xA0, _der(0x02, b"\x02")),  # version v3
+        _der(0x02, serial),               # serialNumber
+        _der(0x30, b""),                  # signatureAlgorithm placeholder
+        _issuer_der(),                    # issuer
+        _der(0x30, b""),                  # validity
+        _der(0x30, b""),                  # subject
+        _der(0x30, b""),                  # subjectPublicKeyInfo
+    ]))
+    return _der(0x30, tbs + _der(0x30, b"") + _der(0x03, b"\x00"))
+
+
+def _signer_info() -> bytes:
+    return _der(0x30, b"".join([
+        _der(0x02, b"\x01"),  # version
+        _der(0x30, _issuer_der() + _der(0x02, CERT_SERIAL)),  # IssuerAndSerialNumber
+        _der(0x30, b""),  # digestAlgorithm
+    ]))
+
+
+def _pkcs7(cert: bytes, chain=()) -> bytes:
     signed_data_oid = _der(0x06, bytes.fromhex("2A864886F70D010702"))
     data_oid = _der(0x06, bytes.fromhex("2A864886F70D010701"))
     inner_content = _der(0x30, data_oid + _der(0xA0, _der(0x04, b"digest")))
@@ -294,37 +354,34 @@ def _pkcs7(cert: bytes) -> bytes:
         _der(0x02, b"\x01"),
         _der(0x31, b""),
         inner_content,
-        _der(0xA0, cert),
-        _der(0x31, b""),
+        _der(0xA0, cert + b"".join(chain)),
+        _der(0x31, _signer_info()),
     ]))
     return _der(0x30, signed_data_oid + _der(0xA0, signed_data))
 
 
-def synthetic_apk(v1=False, v2=False, v3=False, v31=False, include_dex=True) -> bytes:
+def synthetic_apk(v1=False, v2=False, v3=False, v31=False, include_dex=True,
+                  chain_cert=None, manifest_axml=None) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("AndroidManifest.xml", synthetic_manifest_axml())
+        zf.writestr("AndroidManifest.xml", manifest_axml or synthetic_manifest_axml())
         if include_dex:
             zf.writestr("classes.dex", synthetic_dex())
             zf.writestr("classes2.dex", synthetic_dex())
         if v1:
             zf.writestr("META-INF/CERT.SF", "Signature-Version: 1.0\n")
-            zf.writestr("META-INF/CERT.RSA", _pkcs7(cert_der()))
+            zf.writestr("META-INF/CERT.RSA", _pkcs7(cert_der(), (chain_cert,) if chain_cert else ()))
     data = buffer.getvalue()
     pairs = []
     if v2:
-        pairs.append((0x7109871A, _v2_value(cert_der())))
+        pairs.append((0x7109871A, _v2_value(cert_der(), (chain_cert,) if chain_cert else ())))
     if v3:
-        pairs.append((0xF05368C0, _v3_value(cert_der())))
+        pairs.append((0xF05368C0, _v3_value(cert_der(), (chain_cert,) if chain_cert else ())))
     if v31:
-        pairs.append((0x1B93AD61, _v3_value(cert_der())))
+        pairs.append((0x1B93AD61, _v3_value(cert_der(), (chain_cert,) if chain_cert else ())))
     if pairs:
         data = _add_signing_block(data, pairs)
     return data
-
-
-def cert_der() -> bytes:
-    return _der(0x30, _der(0x02, b"\x01") + _der(0x04, b"test-certificate"))
 
 
 class TestAxml(unittest.TestCase):
@@ -347,6 +404,29 @@ class TestAxml(unittest.TestCase):
         with self.assertRaises(ApkError):
             decode_axml(b"not binary xml")
 
+    def test_rejects_truncated_axml(self):
+        data = synthetic_manifest_axml()
+        with self.assertRaises(ApkError):
+            decode_axml(data[: len(data) // 2])
+
+    def test_namespace_collision_is_ignored(self):
+        manifest = decode_axml(synthetic_manifest_axml(custom_collision=True))
+        self.assertEqual(manifest["package"], "com.example.tv")
+        self.assertEqual(manifest["permissions"], ["android.permission.INTERNET"])
+        self.assertEqual(manifest["activities"][0]["name"], ".MainActivity")
+        self.assertEqual(manifest["activities"][0]["resolved_name"], "com.example.tv.MainActivity")
+
+    def test_bool_value_is_not_truthiness(self):
+        self.assertFalse(_bool_value("false"))
+        self.assertTrue(_bool_value("true"))
+        self.assertFalse(_bool_value(0))
+        self.assertTrue(_bool_value(1))
+
+    def test_string_pool_budget(self):
+        with mock.patch.object(apk_module, "_MAX_DECODED_STRINGS", 1):
+            with self.assertRaises(ApkError):
+                decode_axml(synthetic_manifest_axml())
+
 
 class TestDex(unittest.TestCase):
     def test_classes_and_methods(self):
@@ -363,6 +443,23 @@ class TestDex(unittest.TestCase):
     def test_rejects_non_dex(self):
         with self.assertRaises(ApkError):
             parse_dex(b"not a dex file")
+
+    def test_mutf8_supplementary_and_null(self):
+        self.assertEqual(_mutf8(bytes.fromhex("eda081edb080")), "\U00010400")
+        self.assertEqual(_mutf8(b"a\xc0\x80b"), "a\x00b")
+        self.assertEqual(_mutf8("\U00010400".encode("utf-8")), "\U00010400")
+
+    def test_invalid_class_data_offset_is_an_error(self):
+        data = bytearray(synthetic_dex())
+        class_defs_off = struct.unpack_from("<I", data, 100)[0]
+        struct.pack_into("<I", data, class_defs_off + 24, len(data) + 10)
+        with self.assertRaises(ApkError):
+            parse_dex(bytes(data))
+
+    def test_string_budget(self):
+        with mock.patch.object(apk_module, "_MAX_DECODED_STRINGS", 1):
+            with self.assertRaises(ApkError):
+                parse_dex(synthetic_dex())
 
 
 class TestApkInspection(unittest.TestCase):
@@ -396,6 +493,63 @@ class TestApkInspection(unittest.TestCase):
         self.assertEqual(report["signing"]["schemes"], ["v3.1"])
         self.assertEqual(report["signing"]["certificates"][0]["sha256"],
                          hashlib.sha256(cert_der()).hexdigest())
+
+    def test_chain_certificates_are_not_signers(self):
+        chain = cert_der(b"\x2b")
+        apk = synthetic_apk(v2=True, chain_cert=chain)
+        report = inspect_apk(apk)
+        self.assertEqual(report["signing"]["certificates"][0]["sha256"],
+                         hashlib.sha256(cert_der()).hexdigest())
+        self.assertEqual(report["signing"]["chain_certificates"][0]["sha256"],
+                         hashlib.sha256(chain).hexdigest())
+        verifier = Verifier(apk)
+        leaf = Claim.from_dict({"kind": "apk_signing_certificate",
+                                "params": {"sha256": hashlib.sha256(cert_der()).hexdigest()}})
+        issuer = Claim.from_dict({"kind": "apk_signing_certificate",
+                                  "params": {"sha256": hashlib.sha256(chain).hexdigest()}})
+        self.assertEqual(verifier.verify(leaf)["verdict"], VERIFIED)
+        self.assertEqual(verifier.verify(issuer)["verdict"], REFUTED)
+
+    def test_v1_chain_certificate_is_not_signer(self):
+        chain = cert_der(b"\x2b")
+        report = inspect_apk(synthetic_apk(v1=True, chain_cert=chain))
+        self.assertEqual(report["signing"]["certificates"][0]["sha256"],
+                         hashlib.sha256(cert_der()).hexdigest())
+        self.assertEqual(report["signing"]["chain_certificates"][0]["sha256"],
+                         hashlib.sha256(chain).hexdigest())
+
+    def test_malformed_signing_block_is_an_error(self):
+        apk = _corrupt_signing_size(synthetic_apk(v2=True))
+        report = inspect_apk(apk)
+        self.assertEqual(report["signing"]["schemes"], [])
+        self.assertIn("error", report["signing"])
+        verifier = Verifier(apk)
+        claim = Claim.from_dict({"kind": "apk_signing_certificate",
+                                 "params": {"sha256": hashlib.sha256(cert_der()).hexdigest(),
+                                            "present": False}})
+        self.assertEqual(verifier.verify(claim)["verdict"], INCONCLUSIVE)
+
+    def test_truncated_manifest_does_not_verify_absence(self):
+        axml = synthetic_manifest_axml()[:100]
+        apk = synthetic_apk(manifest_axml=axml)
+        report = inspect_apk(apk)
+        self.assertIn("manifest_error", report)
+        verifier = Verifier(apk)
+        claim = Claim.from_dict({"kind": "apk_manifest",
+                                 "params": {"field": "permissions",
+                                            "expected": "android.permission.INTERNET",
+                                            "present": False}})
+        self.assertEqual(verifier.verify(claim)["verdict"], INCONCLUSIVE)
+
+    def test_absurd_dex_filename_is_not_an_apk(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as zf:
+            zf.writestr("AndroidManifest.xml", synthetic_manifest_axml())
+            zf.writestr("classes" + "1" * 5000 + ".dex", b"x")
+        data = buffer.getvalue()
+        self.assertFalse(is_apk(data))
+        self.assertFalse(inspect_apk(data)["is_apk"])
+        self.assertEqual(auto_triage(data)["type"], "ZIP Archive / Package")
 
     def test_auto_triage_identifies_apk(self):
         report = auto_triage(synthetic_apk(), filename="app.apk")
@@ -447,6 +601,14 @@ class TestApkCli(unittest.TestCase):
             cmd_parse_apk(args)
         self.assertIn("Not an APK", out.getvalue())
 
+    def test_parse_apk_shows_signing_error(self):
+        apk = _corrupt_signing_size(synthetic_apk(v2=True))
+        args = argparse.Namespace(file=apk.hex(), json=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_parse_apk(args)
+        self.assertIn("Signing:      unavailable", out.getvalue())
+
 
 class TestApkClaims(unittest.TestCase):
     def setUp(self):
@@ -497,6 +659,19 @@ class TestApkClaims(unittest.TestCase):
         result = self.claim("apk_manifest", field="activity",
                             expected=[".MainActivity", ".Missing"], present=False)
         self.assertEqual(result["verdict"], REFUTED)
+
+    def test_relative_activity_name_resolves_against_package(self):
+        apk = synthetic_apk(manifest_axml=synthetic_manifest_axml(
+            activity_name="com.example.tv.MainActivity"))
+        verifier = Verifier(apk)
+        claim = Claim.from_dict({"kind": "apk_manifest",
+                                 "params": {"field": "activity", "expected": ".MainActivity"}})
+        self.assertEqual(verifier.verify(claim)["verdict"], VERIFIED)
+        claim = Claim.from_dict({"kind": "apk_manifest",
+                                 "params": {"field": "activity_category",
+                                            "activity": ".MainActivity",
+                                            "expected": "android.intent.category.LEANBACK_LAUNCHER"}})
+        self.assertEqual(verifier.verify(claim)["verdict"], VERIFIED)
 
     def test_class_and_method_presence(self):
         result = self.claim("apk_class_present", name="com.example.Hello")

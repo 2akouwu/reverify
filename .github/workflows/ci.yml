@@ -24,7 +24,12 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.9", "3.13"]
         deps: [pure]
+        exclude:
+          # ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build in
+          # actions/python-versions; keep the oldest interpreter on 22.04.
+          - { os: ubuntu-latest, python: "3.9" }
         include:
+          - { os: ubuntu-22.04, python: "3.9", deps: pure }
           # ... and the mature engines (capstone, unicorn, lief, z3) must upgrade it cleanly.
           - { os: ubuntu-latest, python: "3.13", deps: full }
           - { os: windows-latest, python: "3.13", deps: full }
